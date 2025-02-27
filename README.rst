@@ -1,5 +1,5 @@
 ==========
-Linak-ctrl
+linak-mqtt-ctrl
 ==========
 
 .. image:: https://badge.fury.io/py/linak-ctrl.svg
@@ -25,18 +25,18 @@ preferred ways is to use virtualenv and pip:
 
 .. code:: shell-session
 
-   $ git clone https://github.com/gryf/linak-ctrl
+   $ git clone https://github.com/giantorth/linak-mqtt-ctrl
    $ cd linak-ctrl
-   linak-ctrl $ python -m venv linak
-   (linak) linak-ctrl $ pip install .
-   (linak) linak-ctrl $ linak-ctrl status
+   linak-mqtt-ctrl $ python -m venv linak
+   (linak) linak-mqtt-ctrl $ pip install .
+   (linak) linak-mqtt-ctrl $ linak-mqtt-ctrl status
    Position: 767, height: 78.80cm, moving: False
 
 Or, you can install it system-wide:
 
 .. code:: shell-session
 
-   # sudo pip install linak-ctrl
+   # sudo pip install linak-mqtt-ctrl
 
 And finally, you could also install dependences from your system repositories,
 and use script directly, by placing it somewhere in your ``$PATH``.
