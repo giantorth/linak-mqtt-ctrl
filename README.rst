@@ -2,10 +2,7 @@
 linak-mqtt-ctrl
 ==========
 
-.. image:: https://badge.fury.io/py/linak-ctrl.svg
-   :target: https://badge.fury.io/py/linak-ctrl
-
-Simple python script to control Linak powered desks and USB2LIN06 cable.
+Simple python script to control Linak powered desks and USB2LIN06 cable over MQTT, with Home Assistant autodiscovery.
 
 
 Requirements
@@ -14,6 +11,8 @@ Requirements
 * Linak desk ;)
 * USB2LIN06 device
 * Python
+* MQTT server
+* Home Assistant (optional)
 * `pyusb`_
 
 
@@ -26,7 +25,7 @@ preferred ways is to use virtualenv and pip:
 .. code:: shell-session
 
    $ git clone https://github.com/giantorth/linak-mqtt-ctrl
-   $ cd linak-ctrl
+   $ cd linak-mqtt-ctrl
    linak-mqtt-ctrl $ python -m venv linak
    (linak) linak-mqtt-ctrl $ pip install .
    (linak) linak-mqtt-ctrl $ linak-mqtt-ctrl status
@@ -45,10 +44,10 @@ and use script directly, by placing it somewhere in your ``$PATH``.
 Usage
 =====
 
-Currently, script have two available commands: ``status`` and ``move``.
+Currently, script have three available commands: ``status``,  ``move`` and ``mqtt``.
 
 Invoking ``status`` will give information about desk height - both in absolute
-number, and in centimeters, and information if desk is moving.
+number, and in inches/centimeters, and information if desk is moving.
 
 .. code:: shell-session
 
@@ -117,6 +116,12 @@ Adding more `-v` will increase amount of information:
    array('B', [4, 56, 17, 0, 232, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 232, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0])
    Current position: 1000
 
+Command ``mqtt`` is for running in service mode.
+
+.. code:: shell-session
+
+   $ linak_ctrl/__init__.py mqtt 
+   usage: An utility to interact with USB2LIN06 device. mqtt [-h] --server SERVER [--port PORT] --username USERNAME --password PASSWORD
 
 Alternatives
 ============
