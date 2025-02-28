@@ -19,7 +19,7 @@ Requirements
 Installation
 ============
 
-There are couple of different ways for installing ``linak-ctrl``. One of the
+There are couple of different ways for installing ``linak-mqtt-ctrl``. One of the
 preferred ways is to use virtualenv and pip:
 
 .. code:: shell-session
