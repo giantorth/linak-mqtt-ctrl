@@ -8,18 +8,19 @@ Simple python script to control Linak powered desks and USB2LIN06 cable over MQT
 Requirements
 ============
 
-* Linak desk ;)
+* Linak desk
 * USB2LIN06 device
 * Python
 * MQTT server
 * Home Assistant (optional)
-* `pyusb`_
+* `libusb1`_
+* `gmqtt`_
 
 
 Installation
 ============
 
-There are couple of different ways for installing ``linak-mqtt-ctrl``. One of the
+There are a couple of different ways for installing ``linak-mqtt-ctrl``. One of the
 preferred ways is to use virtualenv and pip:
 
 .. code:: shell-session
@@ -37,57 +38,40 @@ Or, you can install it system-wide:
 
    # sudo pip install linak-mqtt-ctrl
 
-And finally, you could also install dependences from your system repositories,
-and use script directly, by placing it somewhere in your ``$PATH``.
+And finally, you could also install dependencies from your system repositories,
+and use the script directly, by placing it somewhere in your ``$PATH``.
 
 
 Usage
 =====
 
-Currently, script have three available commands: ``status``,  ``move`` and ``mqtt``.
+Currently, the script has three available commands: ``status``,  ``move`` and ``mqtt``.
 
 Invoking ``status`` will give information about desk height - both in absolute
-number, and in inches/centimeters, and information if desk is moving.
+number, and in inches/centimeters, and information if the desk is moving.
 
 .. code:: shell-session
 
-   $ linak_ctrl/__init__.py status
+   $ linak-mqtt-ctrl status
    Position: 767, height: 78.80cm, moving: False
 
-Note, that height was measured manually and may differ depending if desk have
-casters or regular foots.
+Note, that height was measured manually and may differ depending if the desk has
+casters or regular feet.
 
-Command ``status`` accept optional parameter ``--loop`` for fetching
-information from USB2LIN06 device every 0.2 seconds:
-
-.. code:: shell-session
-
-   $ linak_ctrl/__init__.py status -l
-   Position: 2161, height: 100.25cm, moving: True
-   Position: 2109, height: 99.45cm, moving: True
-   Position: 2026, height: 98.17cm, moving: True
-   Position: 1960, height: 97.15cm, moving: True
-   Position: 1872, height: 95.80cm, moving: True
-   Position: 1797, height: 94.65cm, moving: True
-   Position: 1728, height: 93.58cm, moving: True
-   Position: 1675, height: 92.77cm, moving: True
-   Position: 1652, height: 92.42cm, moving: True
-   Position: 1651, height: 92.40cm, moving: False
-
-Command ``move`` is used for adjusting desk height. It needs parameter
-``position``, which is absolute number, and its range is between 0 and 6480 (in
+Command ``move`` is used for adjusting desk height. It needs the parameter
+``position``, which is an absolute number, and its range is between 0 and 6480 (in
 my case). For example:
 
 .. code:: shell-session
 
-   $ linak_ctrl/__init__.py move 1000
+   $ linak-mqtt-ctrl move 1000
 
-For displaying debug information verbosity can be increased using ``--verbose``
+For displaying debug information, verbosity can be increased using the ``--verbose``
 parameter:
 
 .. code:: shell-session
 
-   $ linak_ctrl/__init__.py -v move 1000
+   $ linak-mqtt-ctrl -v move 1000
    Current position: 771
    Current position: 792
    Current position: 825
@@ -96,11 +80,11 @@ parameter:
    Current position: 988
    Current position: 1000
 
-Adding more `-v` will increase amount of information:
+Adding more `-v` will increase the amount of information:
 
 .. code:: shell-session
 
-   $ linak_ctrl/__init__.py -vv move 1000
+   $ linak-mqtt-ctrl -vv move 1000
    array('B', [4, 56, 17, 8, 3, 3, 0, 57, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 232, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0])
    Current position: 771
    array('B', [4, 56, 17, 0, 21, 3, 0, 129, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 232, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0])
@@ -120,29 +104,30 @@ Command ``mqtt`` is for running in service mode.
 
 .. code:: shell-session
 
-   $ linak_ctrl/__init__.py mqtt 
+   $ linak-mqtt-ctrl mqtt --server <MQTT_SERVER> --port <MQTT_PORT> --username <MQTT_USERNAME> --password <MQTT_PASSWORD>
    usage: An utility to interact with USB2LIN06 device. mqtt [-h] --server SERVER [--port PORT] --username USERNAME --password PASSWORD
+
+   Will publish Home Assistant autodiscovery messages to MQTT server as a cover.
 
 Alternatives
 ============
 
-There are two projects, which more or less are doing the same. Fist one can be
-treated as a reference project - lots of information in the source code, second
-one is a python project, which uses `libusb1`_ wrapper library instead of
-`pyusb`_:
+There are three projects, which more or less are doing the same.  This script was heavily inspired by linak-ctrl.
 
 * `usb2lin06-HID-in-linux-for-LINAK-Desk-Control-Cable`_
 * `python-linak-desk-control`_
+* `linak-ctrl`_
 
 
 License
 =======
 
-This software is licensed under 3-clause BSD license. See LICENSE file for
+This software is licensed under the 3-clause BSD license. See LICENSE file for
 details.
 
 
-.. _pyusb: https://github.com/pyusb/pyusb
+.. _libusb1: https://github.com/vpelletier/python-libusb1
+.. _gmqtt: https://github.com/wialon/gmqtt
 .. _usb2lin06-HID-in-linux-for-LINAK-Desk-Control-Cable: https://github.com/UrbanskiDawid/usb2lin06-HID-in-linux-for-LINAK-Desk-Control-Cable
 .. _python-linak-desk-control: https://github.com/monofox/python-linak-desk-control
-.. _libusb1: https://github.com/vpelletier/python-libusb1
+.. _linak-ctrl: https://github.com/gryf/linak-ctrl
