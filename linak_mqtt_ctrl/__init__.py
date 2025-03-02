@@ -25,6 +25,11 @@ BUF_LEN = 64
 MODE_OF_OPERATION = 0x03
 MODE_OF_OPERATION_DEFAULT = 0x04
 
+# USB Button commands
+MOVE_DOWN = 32767
+MOVE_UP = 32768
+MOVE_STOP = 32769
+
 # MQTT and device constants
 MQTT_TOPIC = "linak/desk"
 DEVICE_NAME = "Linak Desk"
@@ -183,7 +188,6 @@ class AsyncLinakDevice:
                 self.loop.call_soon_threadsafe(
                     future.set_exception, Exception("Transfer error: " + str(status))
                 )
-
         try:
             transfer.setControl(request_type, request, value, index, data)
             transfer.setCallback(callback)
@@ -214,11 +218,15 @@ class AsyncLinakDevice:
         while True:
             await self._move(position)
             await asyncio.sleep(0.2)
+
             raw = await self.async_ctrl_transfer(
                 REQ_TYPE_GET_INTERFACE, HID_GET_REPORT, GET_STATUS, 0, bytearray(BUF_LEN)
             )
             status_report = StatusReport(raw)
             LOG.info("Current position: %s", status_report.position)
+
+            if position == MOVE_UP or position == MOVE_DOWN or position == MOVE_STOP:
+                break
             if status_report.position == position:
                 break
             if previous_position == status_report.position:
@@ -248,7 +256,7 @@ class AsyncLinakDevice:
         """
         self._shutdown = True
         self.event_thread.join()
-        time.sleep(1)  # Allow time for the event thread to exit
+        # time.sleep(1)  # Allow time for the event thread to exit
         self.handle.close()
         self.context.close()
 
@@ -273,6 +281,10 @@ class AsyncMQTTClient:
         self.broker = broker
         self.port = port
         self.async_device = async_device
+        self.payload_open = "OPEN"
+        self.payload_stop = "STOP"
+        self.payload_close = "CLOSE"
+
 
         # Track last published state to avoid unnecessary updates.
         self.last_state = None
@@ -293,7 +305,6 @@ class AsyncMQTTClient:
         # Set gmqtt event callbacks.
         self.client.on_connect = self.on_connect
         self.client.on_message = self.on_message
-        # self.client.on_disconnect = self.on_disconnect
         self.client.on_subscribe = self.on_subscribe
         self.client.on_log = self.on_log
 
@@ -337,52 +348,44 @@ class AsyncMQTTClient:
         If the message is on the command topic, process the movement command.
         """
         decoded_payload = payload.decode() if isinstance(payload, bytes) else payload
-        LOG.info("Received message on topic %s: %s", topic, decoded_payload)
         if topic == self.command_topic:
-            try:
-                position_percent = int(decoded_payload)
-                position = self.percent_to_position(position_percent)
-                LOG.info("Moving device to position: %s", position)
+            # Process payload that might be numeric or a special command string.
+            if isinstance(decoded_payload, (int, float)):
+                command_value = decoded_payload
+            else:
+                # Try converting to a number, otherwise keep as string.
+                try:
+                    command_value = int(decoded_payload)
+                except ValueError:
+                    command_value = decoded_payload
+        
+            # Log the interpreted command value.
+            LOG.info("Received message on topic %s: %s", topic, command_value)
+        
+            if command_value == self.payload_open:
+                asyncio.create_task(self.async_device._move(MOVE_UP))
+                position = MOVE_UP
+            elif command_value == self.payload_close:
+                asyncio.create_task(self.async_device._move(MOVE_DOWN))
+                position = MOVE_DOWN
+            elif command_value == self.payload_stop:
+                asyncio.create_task(self.async_device._move(MOVE_STOP))
+                position = MOVE_STOP
+            elif isinstance(command_value, int):
+                # Otherwise assume it's a percentage value.
+                position = self.percent_to_position(command_value)
                 asyncio.create_task(self.async_device.move(position))
-            except ValueError:
+            else:
                 LOG.error("Invalid position value received: %s", decoded_payload)
                 return 131
+            LOG.info("Moving device to position: %s", position)
         return 0
-
-    def on_disconnect(self, client, packet, exc=None):
-        """
-        Callback when the client disconnects from the MQTT broker.
-        Prevents multiple reconnect attempts by checking the reconnecting flag.
-        """
-        LOG.warning("Disconnected from MQTT broker. Client: %s, Packet: %s, Exception: %s", client, packet, exc)
-        if not self.reconnecting:
-            self.reconnecting = True
-            asyncio.create_task(self.reconnect())
-        else:
-            LOG.debug("Reconnect already in progress; ignoring duplicate disconnect event.")
 
     def on_subscribe(self, client, mid, qos, properties):
         """
         Callback when subscription is successful.
         """
         LOG.info("Subscribed to topic with mid: %s", mid)
-
-    async def reconnect(self):
-        """
-        Attempts to reconnect to the MQTT broker after a 5-second delay.
-        Only one reconnect attempt will run at a time.
-        """
-        await asyncio.sleep(5)
-        try:
-            await self.client.reconnect()
-            LOG.info("Reconnected to MQTT broker")
-        except Exception as e:
-            LOG.error("Reconnection failed: %s", e)
-            # If reconnection fails, schedule another attempt.
-            asyncio.create_task(self.reconnect())
-        finally:
-            # Reset the flag to allow future reconnect attempts if necessary.
-            self.reconnecting = False
 
     async def publish_discovery(self):
         """
@@ -393,12 +396,16 @@ class AsyncMQTTClient:
             "state_topic": self.state_topic,
             "state_open": 100,
             "state_closed": 0,
+            "value_template": "{{ value_json.position }}",
             "command_topic": self.command_topic,
             "availability_topic": self.availability_topic,
             "position_open": 100,
             "position_closed": 0,
             "position_topic": self.state_topic,
             "position_template": "{{ value_json.position }}",
+            "payload_open": self.payload_open,
+            "payload_stop": self.payload_stop,
+            "payload_close": self.payload_close,
             "set_position_topic": self.command_topic,
             "set_position_template": "{{ value }}",
             "json_attributes_topic": self.state_topic,
@@ -481,10 +488,19 @@ async def async_main(args):
     device = await AsyncLinakDevice.create(asyncio.get_running_loop())
     mqtt_client = None
 
+    shutdown_triggered = False
+
     async def signal_handler():
+        nonlocal shutdown_triggered
+        if shutdown_triggered:
+            return
+        shutdown_triggered = True
         LOG.info("Received exit signal, shutting down...")
         if mqtt_client:
-            await mqtt_client.disconnect()
+            try:
+                await mqtt_client.disconnect()
+            except Exception as e:
+                LOG.error("Error during MQTT disconnect: %s", e)
         device.shutdown()
 
     # Register signal handlers for graceful shutdown.
@@ -493,7 +509,10 @@ async def async_main(args):
 
     try:
         if args.func == 'status':
-            await device.get_position()
+            report = await device.get_position()
+            # not printed otherwse without verbose flags
+            LOG.error('Position: %s, height: %.2fcm, moving: %s',
+                  report.position, report.position_in_cm, report.moving)
         elif args.func == 'move':
             await device.move(args.position)
         elif args.func == 'mqtt':
