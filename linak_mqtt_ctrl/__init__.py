@@ -495,13 +495,13 @@ async def async_main(args):
         if shutdown_triggered:
             return
         shutdown_triggered = True
-        LOG.info("Received exit signal, shutting down...")
+        LOG.warning("Received exit signal, shutting down...")
+        device.shutdown()
         if mqtt_client:
             try:
                 await mqtt_client.disconnect()
             except Exception as e:
                 LOG.error("Error during MQTT disconnect: %s", e)
-        device.shutdown()
 
     # Register signal handlers for graceful shutdown.
     signal.signal(signal.SIGINT, lambda s, f: asyncio.create_task(signal_handler()))
