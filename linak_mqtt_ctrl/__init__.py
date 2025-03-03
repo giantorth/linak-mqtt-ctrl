@@ -364,7 +364,7 @@ class AsyncLinakDevice:
 
     async def _move(self, position):
         """
-        Helper method to send the MOVE command.
+        Helper method to send the MOVE command to USB.
         """
         buf = bytearray(BUF_LEN)
         pos = f"{position:04x}"  # Convert position to a 4-digit hex string
@@ -633,7 +633,7 @@ class AsyncMQTTClient:
             LOG.info("Publishing discovery payload for the first time.")
         self._last_discovery_publish = now
 
-        # Cover discovery payload (existing)
+        # Cover discovery payload
         discovery_payload = {
             "name": self.device_name,
             "unique_id": self.entity_id,
@@ -665,7 +665,7 @@ class AsyncMQTTClient:
         LOG.info("MQTT Publishing discovery payload: %s", discovery_payload)
         self.client.publish(topic, payload_json, qos=1, retain=True)
 
-        # Lock discovery payload (existing, now connected to functionality)
+        # Lock discovery payload
         discovery_payload_lock = {
             "name": f"{self.device_name} Lock",
             "command_topic": "linak/desk/lock/set",
@@ -688,7 +688,6 @@ class AsyncMQTTClient:
         self.client.publish(topic_lock, payload_lock_json, qos=1, retain=True)
         # Publish the lock state immediately after discovery.
         self.client.publish("linak/desk/lock/state", "UNLOCKED", qos=1)
-
 
     async def publish_availability(self, payload):
         """
@@ -718,6 +717,17 @@ class AsyncMQTTClient:
         await self.publish_availability("offline")
         await self.client.disconnect()
 
+    async def cleanup(self):
+        """
+        Cancels any active repeating move task to ensure a graceful shutdown.
+        """
+        if self._button_repeat_task:
+            self._button_repeat_task.cancel()
+            try:
+                await self._button_repeat_task
+            except asyncio.CancelledError:
+                LOG.info("Button repeat task cancelled during cleanup.")
+
 ###############################################################################
 # Main Async Entry Point and Signal Handling
 ###############################################################################
@@ -728,51 +738,66 @@ async def async_main(args):
     device = await AsyncLinakDevice.create(asyncio.get_running_loop())
     mqtt_client = None
     shutdown_triggered = False
+    run_loop_task = None
     loop = asyncio.get_running_loop()
 
     async def signal_handler():
-        nonlocal shutdown_triggered
+        nonlocal shutdown_triggered, run_loop_task
         if shutdown_triggered:
             return
         shutdown_triggered = True
         LOG.warning("Received exit signal, shutting down...")
-        # First disconnect MQTT if it exists
+
+        # Disconnect MQTT client and run cleanup
         if mqtt_client:
             try:
                 await mqtt_client.disconnect()
+                await mqtt_client.cleanup()
             except Exception as e:
-                LOG.error("Error during MQTT disconnect: %s", e)
+                LOG.error("Error during MQTT disconnect/cleanup: %s", e)
         
-        # Add a small delay to ensure MQTT operations complete
+        # Cancel the device run loop task if it exists
+        if run_loop_task:
+            run_loop_task.cancel()
+            try:
+                await run_loop_task
+            except asyncio.CancelledError:
+                LOG.info("Device run loop task cancelled.")
+
+        # Allow time for MQTT operations to complete
         await asyncio.sleep(0.5)
         
-        # Then shutdown the USB device
+        # Shutdown the USB device
         try:
             device.shutdown()
         except Exception as e:
             LOG.error("Error during device shutdown: %s", e)
 
-    # Use loop.add_signal_handler for clean integration with asyncio.
-    try:
-        loop.add_signal_handler(signal.SIGINT, lambda: asyncio.create_task(signal_handler()))
-        loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(signal_handler()))
-    except NotImplementedError:
-        pass
+        # Cancel all remaining tasks to ensure a clean exit
+        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        for task in tasks:
+            task.cancel()
 
     try:
         if args.func == 'status':
             report = await device.get_position()
-            LOG.error('Position: %s, height: %.2fcm, moving: %s',
-                      report.position, report.position_in_cm, report.moving)
+            LOG.warning('Position: %s, height: %.2fcm, moving: %s',
+                     report.position, report.position_in_cm, report.moving)
         elif args.func == 'move':
             await device.move(args.position)
+            report = await device.get_position()
+            LOG.warning("Current position: %s", report.position)
         elif args.func == 'mqtt':
             mqtt_client = AsyncMQTTClient(args.server, args.port, DEVICE_NAME, device, args.username, args.password)
             await mqtt_client.connect()
-            # Instead of awaiting run_loop, we schedule it as a background task.
-            asyncio.create_task(device.run_loop(mqtt_client.publish_state))
-            # Now wait indefinitely so that the event loop remains active.
-            await asyncio.Event().wait()
+            # Schedule the device run loop as a background task.
+            run_loop_task = asyncio.create_task(device.run_loop(mqtt_client.publish_state))
+            # Instead of waiting indefinitely on an Event, use a periodic sleep loop that checks for shutdown.
+            try:
+                while not shutdown_triggered:
+                    await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                LOG.info("Main MQTT loop sleep cancelled. Shutting down gracefully.")
     finally:
         await signal_handler()
 
