@@ -8,6 +8,8 @@ import asyncio
 import usb1  # Using libusb1 for asynchronous USB transfers
 import signal
 import time
+import queue
+from logging.handlers import QueueHandler, QueueListener
 
 # Import gmqtt for asyncio-native MQTT communication.
 from gmqtt import Client as GMQTTClient
@@ -35,21 +37,26 @@ MQTT_TOPIC = "linak/desk"
 DEVICE_NAME = "Linak Desk"
 
 ###############################################################################
-# Logger Class
+# Asynchronous Logger Setup Using QueueHandler/QueueListener
 ###############################################################################
 class Logger:
     """
-    A simple logger that outputs to the console.
+    A logger that uses asynchronous logging to avoid blocking the asyncio event loop.
+    Instead of writing log messages directly to sys.stderr (which may be slow),
+    this logger enqueues log records and processes them on a separate thread.
     """
     def __init__(self, logger_name):
+        # Create a logger instance
         self._log = logging.getLogger(logger_name)
         self.setup_logger()
+        # Expose set_verbose for convenience
         self._log.set_verbose = self.set_verbose
 
     def __call__(self):
         return self._log
 
     def set_verbose(self, verbose_level, quiet_level):
+        # Adjust log level based on verbose/quiet settings.
         self._log.setLevel(logging.WARNING)
         if quiet_level:
             self._log.setLevel(logging.ERROR)
@@ -61,15 +68,31 @@ class Logger:
                 self._log.setLevel(logging.DEBUG)
 
     def setup_logger(self):
+        """
+        Configure the logger to use a QueueHandler so that log messages are processed
+        asynchronously. This helps prevent logging from blocking the main asyncio loop.
+        """
+        # If already configured, do nothing.
         if self._log.handlers:
             return
-        console_handler = logging.StreamHandler(sys.stderr)
-        console_handler.set_name("console")
-        console_formatter = logging.Formatter("%(message)s")
-        console_handler.setFormatter(console_formatter)
-        self._log.addHandler(console_handler)
+
+        # Create a queue for log records.
+        log_queue = queue.Queue(-1)
+        # Create a QueueHandler that will send log records to the queue.
+        queue_handler = QueueHandler(log_queue)
+        self._log.addHandler(queue_handler)
+        # Create a StreamHandler that writes to sys.stderr.
+        stream_handler = logging.StreamHandler(sys.stderr)
+        stream_handler.setFormatter(logging.Formatter("%(message)s"))
+        # Create a QueueListener that will listen to the queue and dispatch records to stream_handler.
+        listener = QueueListener(log_queue, stream_handler)
+        listener.start()
+        # Save a reference to the listener so it isn’t garbage-collected.
+        self._listener = listener
+        # Set a default level.
         self._log.setLevel(logging.WARNING)
 
+# Initialize the logger instance.
 LOG = Logger(__name__)()
 
 ###############################################################################
@@ -114,9 +137,9 @@ class AsyncLinakDevice:
 
     KEY CHANGES:
     1. The async_ctrl_transfer method uses asyncio.wait_for to enforce a timeout.
-    2. The run_loop method now schedules get_position as a separate task with a short timeout
-       (0.5 seconds). This prevents a hanging USB call from blocking the event loop and delaying
-       MQTT ping responses.
+    2. If a USB control transfer times out, the underlying USB transfer is explicitly canceled.
+    3. The run_loop method schedules get_position as a separate task with a short timeout,
+       ensuring that a hanging USB call does not block the event loop and delay MQTT ping responses.
     """
     VEND = 0x12d3
     PROD = 0x0002
@@ -176,6 +199,8 @@ class AsyncLinakDevice:
 
         This method has been updated to include a timeout to prevent long-running USB operations
         from blocking the main asyncio event loop and, consequently, delaying MQTT ping responses.
+        In addition, if the wait_for times out, the underlying USB transfer is explicitly canceled,
+        freeing resources and preventing lingering transfers.
 
         Parameters:
             request_type: The USB request type.
@@ -216,7 +241,17 @@ class AsyncLinakDevice:
             future.set_exception(e)
 
         # Enforce a timeout on the USB transfer using asyncio.wait_for.
-        return await asyncio.wait_for(future, timeout=timeout/1000)
+        try:
+            result = await asyncio.wait_for(future, timeout=timeout/1000)
+            return result
+        except asyncio.TimeoutError:
+            # If the wait_for times out, explicitly cancel the underlying USB transfer.
+            try:
+                transfer.cancel()
+                LOG.error("Cancelled USB transfer due to timeout.")
+            except Exception as e:
+                LOG.error("Error cancelling USB transfer: %s", e)
+            raise
 
     async def get_position(self):
         """
@@ -557,12 +592,21 @@ async def async_main(args):
             return
         shutdown_triggered = True
         LOG.warning("Received exit signal, shutting down...")
-        device.shutdown()
+        # First disconnect MQTT if it exists
         if mqtt_client:
             try:
                 await mqtt_client.disconnect()
             except Exception as e:
                 LOG.error("Error during MQTT disconnect: %s", e)
+        
+        # Add a small delay to ensure MQTT operations complete
+        await asyncio.sleep(0.5)
+        
+        # Then shutdown the USB device
+        try:
+            device.shutdown()
+        except Exception as e:
+            LOG.error("Error during device shutdown: %s", e)
 
     # Use loop.add_signal_handler for clean integration with asyncio.
     try:
