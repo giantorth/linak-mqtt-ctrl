@@ -33,8 +33,9 @@ MOVE_UP = 32768
 MOVE_STOP = 32769
 
 # MQTT and device constants
-MQTT_TOPIC = "linak/desk"
-DEVICE_NAME = "Linak Desk"
+DEVICE_NAME = "Standing Desk"
+DESK_MAX_HEIGHT = 6715
+DESK_MIN_TRAVEL = 1550
 
 ###############################################################################
 # Asynchronous Logger Setup Using QueueHandler/QueueListener
@@ -110,14 +111,14 @@ class StatusReport:
         calibration = {
             'unit': 'in',
             'point1': {'raw': 0, 'height': 25.61},    # lowest position
-            'point2': {'raw': 6715, 'height': 51.61}  # highest position
+            'point2': {'raw': DESK_MAX_HEIGHT, 'height': 51.61}  # highest position
         }
         
         # Using centimeters
         calibration = {
             'unit': 'cm',
             'point1': {'raw': 0, 'height': 67},      # lowest position
-            'point2': {'raw': 6715, 'height': 132}   # highest position
+            'point2': {'raw': DESK_MAX_HEIGHT, 'height': 132}   # highest position
         }
     """
     def __init__(self, raw_response, calibration=None):
@@ -125,7 +126,7 @@ class StatusReport:
         self._default_calibration = {
             'unit': 'both',
             'point1': {'raw': 0, 'height_cm': 67, 'height_in': 25.61},
-            'point2': {'raw': 6715, 'height_cm': 132, 'height_in': 51.61}
+            'point2': {'raw': DESK_MAX_HEIGHT, 'height_cm': 132, 'height_in': 51.61}
         }
         
         # Set calibration data
@@ -149,12 +150,12 @@ class StatusReport:
             self.position_in_cm = self._interpolate_height(
                 self.position,
                 0, self._default_calibration['point1']['height_cm'],
-                6715, self._default_calibration['point2']['height_cm']
+                DESK_MAX_HEIGHT, self._default_calibration['point2']['height_cm']
             )
             self.position_in_in = self._interpolate_height(
                 self.position,
                 0, self._default_calibration['point1']['height_in'],
-                6715, self._default_calibration['point2']['height_in']
+                DESK_MAX_HEIGHT, self._default_calibration['point2']['height_in']
             )
         else:
             # Using custom calibration
@@ -194,7 +195,7 @@ class StatusReport:
 ###############################################################################
 class AsyncLinakDevice:
     """
-    Asynchronous USB device class using libusb1’s asynchronous control transfers.
+    Asynchronous USB device class using libusb1 asynchronous control transfers.
     This class also contains a continuous run loop (via the run_loop() method) that
     monitors the device state and calls a publish callback whenever the state changes.
 
@@ -388,9 +389,9 @@ class AsyncLinakDevice:
         """
         Helper method to convert a raw position value to a percentage (0-100).
         """
-        return int((position / 6715) * 100)
+        return int((position / DESK_MAX_HEIGHT) * 100)
 
-    async def run_loop(self, publish_callback, poll_interval=2):
+    async def run_loop(self, publish_callback, poll_interval=1):
         """
         Continuously monitors the device state.
         Instead of directly awaiting get_position, we schedule it as a separate task
@@ -484,6 +485,9 @@ class AsyncMQTTClient:
         # Initialize discovery publish timestamp (for logging purposes only).
         self._last_discovery_publish = None
 
+        # NEW: Initialize movement repeater task holder.
+        self._button_repeat_task = None
+
     def on_log(self, client, level, buf):
         """
         Callback for logging MQTT events.
@@ -546,12 +550,21 @@ class AsyncMQTTClient:
             LOG.info("Processing movement command: %s", command_value)
 
             if command_value == self.payload_open:
-                asyncio.create_task(self.async_device._move(MOVE_UP))
+                # Cancel any existing repeating task before starting a new one.
+                if self._button_repeat_task:
+                    self._button_repeat_task.cancel()
+                self._button_repeat_task = asyncio.create_task(self._repeat_button(MOVE_UP))
                 position = MOVE_UP
             elif command_value == self.payload_close:
-                asyncio.create_task(self.async_device._move(MOVE_DOWN))
+                if self._button_repeat_task:
+                    self._button_repeat_task.cancel()
+                self._button_repeat_task = asyncio.create_task(self._repeat_button(MOVE_DOWN))
                 position = MOVE_DOWN
             elif command_value == self.payload_stop:
+                # Cancel any active repeating move.
+                if self._button_repeat_task:
+                    self._button_repeat_task.cancel()
+                    self._button_repeat_task = None
                 asyncio.create_task(self.async_device._move(MOVE_STOP))
                 position = MOVE_STOP
             elif isinstance(command_value, int):
@@ -583,6 +596,24 @@ class AsyncMQTTClient:
             LOG.warning("Received message on an unrecognized topic: %s", topic)
         return 0
 
+    async def _repeat_button(self, move_command):
+        """
+        Repeatedly sends the given move_command every 0.3 seconds.
+        Runs until cancelled (e.g. when a MOVE_STOP arrives) or when the desk reaches its limits.
+        """
+        try:
+            while True:
+                await self.async_device._move(move_command)
+                report = await self.async_device.get_position()
+                # Check if the desk has reached its lower or upper limit.
+                if report.position <= 0 or report.position >= DESK_MAX_HEIGHT:
+                    LOG.info("Desk reached limit (%s). Cancelling repeating move command.", report.position)
+                    break
+                await asyncio.sleep(0.3)
+        except asyncio.CancelledError:
+            LOG.info("Repeating move command cancelled.")
+            raise
+
     def on_subscribe(self, client, mid, qos, properties):
         """
         Callback when subscription is successful.
@@ -604,6 +635,7 @@ class AsyncMQTTClient:
 
         # Cover discovery payload (existing)
         discovery_payload = {
+            "name": self.device_name,
             "unique_id": self.entity_id,
             "state_topic": self.state_topic,
             "state_open": 100,
@@ -631,7 +663,7 @@ class AsyncMQTTClient:
         topic = f"homeassistant/cover/{self.device_name.replace(' ', '_').lower()}/config"
         payload_json = json.dumps(discovery_payload)
         LOG.info("MQTT Publishing discovery payload: %s", discovery_payload)
-        self.client.publish(topic, payload_json, qos=1)
+        self.client.publish(topic, payload_json, qos=1, retain=True)
 
         # Lock discovery payload (existing, now connected to functionality)
         discovery_payload_lock = {
@@ -653,7 +685,7 @@ class AsyncMQTTClient:
         topic_lock = f"homeassistant/lock/{self.device_name.replace(' ', '_').lower()}_lock/config"
         payload_lock_json = json.dumps(discovery_payload_lock)
         LOG.info("MQTT Publishing discovery payload for lock: %s", discovery_payload_lock)
-        self.client.publish(topic_lock, payload_lock_json, qos=1)
+        self.client.publish(topic_lock, payload_lock_json, qos=1, retain=True)
         # Publish the lock state immediately after discovery.
         self.client.publish("linak/desk/lock/state", "UNLOCKED", qos=1)
 
@@ -677,7 +709,7 @@ class AsyncMQTTClient:
         """
         Converts a percentage (0-100) to a raw position value.
         """
-        return int((percent / 100) * 6715)
+        return int((percent / 100) * DESK_MAX_HEIGHT)
 
     async def disconnect(self):
         """
