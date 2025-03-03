@@ -8,6 +8,8 @@ import asyncio
 import usb1  # Using libusb1 for asynchronous USB transfers
 import signal
 import time
+import queue
+from logging.handlers import QueueHandler, QueueListener
 
 # Import gmqtt for asyncio-native MQTT communication.
 from gmqtt import Client as GMQTTClient
@@ -25,26 +27,36 @@ BUF_LEN = 64
 MODE_OF_OPERATION = 0x03
 MODE_OF_OPERATION_DEFAULT = 0x04
 
+# USB Button commands
+MOVE_DOWN = 32767
+MOVE_UP = 32768
+MOVE_STOP = 32769
+
 # MQTT and device constants
 MQTT_TOPIC = "linak/desk"
 DEVICE_NAME = "Linak Desk"
 
 ###############################################################################
-# Logger Class
+# Asynchronous Logger Setup Using QueueHandler/QueueListener
 ###############################################################################
 class Logger:
     """
-    A simple logger that outputs to the console.
+    A logger that uses asynchronous logging to avoid blocking the asyncio event loop.
+    Instead of writing log messages directly to sys.stderr (which may be slow),
+    this logger enqueues log records and processes them on a separate thread.
     """
     def __init__(self, logger_name):
+        # Create a logger instance.
         self._log = logging.getLogger(logger_name)
         self.setup_logger()
+        # Expose set_verbose for convenience.
         self._log.set_verbose = self.set_verbose
 
     def __call__(self):
         return self._log
 
     def set_verbose(self, verbose_level, quiet_level):
+        # Adjust log level based on verbose/quiet settings.
         self._log.setLevel(logging.WARNING)
         if quiet_level:
             self._log.setLevel(logging.ERROR)
@@ -56,15 +68,31 @@ class Logger:
                 self._log.setLevel(logging.DEBUG)
 
     def setup_logger(self):
+        """
+        Configure the logger to use a QueueHandler so that log messages are processed
+        asynchronously. This helps prevent logging from blocking the main asyncio loop.
+        """
+        # If already configured, do nothing.
         if self._log.handlers:
             return
-        console_handler = logging.StreamHandler(sys.stderr)
-        console_handler.set_name("console")
-        console_formatter = logging.Formatter("%(message)s")
-        console_handler.setFormatter(console_formatter)
-        self._log.addHandler(console_handler)
+
+        # Create a queue for log records.
+        log_queue = queue.Queue(-1)
+        # Create a QueueHandler that will send log records to the queue.
+        queue_handler = QueueHandler(log_queue)
+        self._log.addHandler(queue_handler)
+        # Create a StreamHandler that writes to sys.stderr.
+        stream_handler = logging.StreamHandler(sys.stderr)
+        stream_handler.setFormatter(logging.Formatter("%(message)s"))
+        # Create a QueueListener that will listen to the queue and dispatch records to stream_handler.
+        listener = QueueListener(log_queue, stream_handler)
+        listener.start()
+        # Save a reference to the listener so it isn’t garbage-collected.
+        self._listener = listener
+        # Set a default level.
         self._log.setLevel(logging.WARNING)
 
+# Initialize the logger instance.
 LOG = Logger(__name__)()
 
 ###############################################################################
@@ -72,44 +100,109 @@ LOG = Logger(__name__)()
 ###############################################################################
 class StatusReport:
     """
-    Get the status: position and movement
+    Get the status: position and movement.
 
-    Measurement height in cm has been taken manually. In minimal height,
-    height from floor to the underside of the desktop and is 67cm. Note, this
-    value may differ, since mine desk have wheels. In maximal elevation, it is
-    132cm.
-    For readings from the USB device, numbers are absolute, and have values of
-    0 and 6480 for min and max positions.
-
-    Exposed position information in cm is than taken as a result of the
-    equation:
-
-        position_in_cm = actual_read_position / (132 - 67) + 67
-
-    For inches, the equation is:
-    1658→32 inches
-    6715→51.5 inches
-
-        postition_in_in = 0.003856 * actual_read_position + 25.61
-
+    The raw response contains absolute position values that range from 0 to 6715.
+    Height calculations are based on two calibration points provided during initialization.
+    
+    Example usage:
+        # Using inches
+        calibration = {
+            'unit': 'in',
+            'point1': {'raw': 0, 'height': 25.61},    # lowest position
+            'point2': {'raw': 6715, 'height': 51.61}  # highest position
+        }
+        
+        # Using centimeters
+        calibration = {
+            'unit': 'cm',
+            'point1': {'raw': 0, 'height': 67},      # lowest position
+            'point2': {'raw': 6715, 'height': 132}   # highest position
+        }
     """
-
-    def __init__(self, raw_response):
+    def __init__(self, raw_response, calibration=None):
+        # Default calibration if none provided (backward compatibility)
+        self._default_calibration = {
+            'unit': 'both',
+            'point1': {'raw': 0, 'height_cm': 67, 'height_in': 25.61},
+            'point2': {'raw': 6715, 'height_cm': 132, 'height_in': 51.61}
+        }
+        
+        # Set calibration data
+        self._calibration = calibration if calibration else self._default_calibration
+        
+        # Determine if the device is moving (based on the 7th byte in the response)
         self.moving = raw_response[6] > 0
+        
+        # Combine two bytes to form the raw position value
         self.position = raw_response[4] + (raw_response[5] << 8)
-        self.position_in_cm = self.position / 65 + 67
-        self.position_in_in = (self.position * 0.003856) + 25.61
+        
+        # Calculate heights based on calibration
+        self._calculate_heights()
+        
         LOG.info(f"Linak Position: {self.position}, Moving: {self.moving}")
 
+    def _calculate_heights(self):
+        """Calculate heights based on calibration data and current position."""
+        if self._calibration['unit'] == 'both':
+            # Using default calibration with both units
+            self.position_in_cm = self._interpolate_height(
+                self.position,
+                0, self._default_calibration['point1']['height_cm'],
+                6715, self._default_calibration['point2']['height_cm']
+            )
+            self.position_in_in = self._interpolate_height(
+                self.position,
+                0, self._default_calibration['point1']['height_in'],
+                6715, self._default_calibration['point2']['height_in']
+            )
+        else:
+            # Using custom calibration
+            height = self._interpolate_height(
+                self.position,
+                self._calibration['point1']['raw'],
+                self._calibration['point1']['height'],
+                self._calibration['point2']['raw'],
+                self._calibration['point2']['height']
+            )
+            
+            if self._calibration['unit'] == 'in':
+                self.position_in_in = height
+                self.position_in_cm = self._inches_to_cm(height)
+            else:  # cm
+                self.position_in_cm = height
+                self.position_in_in = self._cm_to_inches(height)
+
+    def _interpolate_height(self, raw_pos, raw1, height1, raw2, height2):
+        """
+        Linear interpolation between two calibration points.
+        """
+        if raw2 == raw1:
+            return height1
+        return height1 + (raw_pos - raw1) * (height2 - height1) / (raw2 - raw1)
+
+    def _inches_to_cm(self, inches):
+        """Convert inches to centimeters."""
+        return inches * 2.54
+
+    def _cm_to_inches(self, cm):
+        """Convert centimeters to inches."""
+        return cm / 2.54
+
 ###############################################################################
-# AsyncLinakDevice Class
+# AsyncLinakDevice Class (The 'Linak' Class)
 ###############################################################################
 class AsyncLinakDevice:
     """
     Asynchronous USB device class using libusb1’s asynchronous control transfers.
-    Creates a USB context, opens the device, detaches the kernel driver if necessary,
-    and initializes the device asynchronously. A dedicated thread continuously handles
-    USB events.
+    This class also contains a continuous run loop (via the run_loop() method) that
+    monitors the device state and calls a publish callback whenever the state changes.
+
+    KEY CHANGES:
+    1. The async_ctrl_transfer method uses asyncio.wait_for to enforce a timeout.
+    2. If a USB control transfer times out, the underlying USB transfer is explicitly canceled.
+    3. The run_loop method schedules get_position as a separate task with a short timeout,
+       ensuring that a hanging USB call does not block the event loop and delay MQTT ping responses.
     """
     VEND = 0x12d3
     PROD = 0x0002
@@ -166,16 +259,35 @@ class AsyncLinakDevice:
     async def async_ctrl_transfer(self, request_type, request, value, index, data, timeout=1000):
         """
         Wraps an asynchronous control transfer.
+
+        This method includes a timeout to prevent long-running USB operations
+        from blocking the main asyncio event loop and delaying MQTT ping responses.
+        If the timeout is exceeded, the underlying USB transfer is explicitly canceled.
+
+        Parameters:
+            request_type: The USB request type.
+            request: The USB request.
+            value: The value for the request.
+            index: The index for the request.
+            data: The data buffer for the request.
+            timeout: Timeout in milliseconds (default 1000 ms).
+
+        Returns:
+            The result data from the USB control transfer.
+
+        Raises:
+            TimeoutError if the transfer does not complete within the specified timeout.
+            Exception if the transfer fails.
         """
-        start_time = time.time()  # Capture the start time
+        start_time = time.time()
         future = self.loop.create_future()
         transfer = self.handle.getTransfer()
 
         def callback(transfer):
             status = transfer.getStatus()
-            end_time = time.time()  # Capture the end time
-            duration = end_time - start_time  # Calculate the duration
-            LOG.info("USB control transfer duration: %.4f seconds", duration)  # Log the duration
+            end_time = time.time()
+            duration = end_time - start_time
+            LOG.debug("USB control transfer duration: %.4f seconds", duration)
             if status == usb1.TRANSFER_COMPLETED:
                 result_data = bytes(transfer.getBuffer()[:transfer.getActualLength()])
                 self.loop.call_soon_threadsafe(future.set_result, result_data)
@@ -183,22 +295,38 @@ class AsyncLinakDevice:
                 self.loop.call_soon_threadsafe(
                     future.set_exception, Exception("Transfer error: " + str(status))
                 )
-
         try:
             transfer.setControl(request_type, request, value, index, data)
             transfer.setCallback(callback)
             transfer.submit()
         except Exception as e:
             future.set_exception(e)
-        return await future
+
+        # Enforce a timeout on the USB transfer using asyncio.wait_for.
+        try:
+            result = await asyncio.wait_for(future, timeout=timeout/1000)
+            return result
+        except asyncio.TimeoutError:
+            # If the wait_for times out, explicitly cancel the underlying USB transfer.
+            try:
+                transfer.cancel()
+                LOG.error("Cancelled USB transfer due to timeout.")
+            except Exception as e:
+                LOG.error("Error cancelling USB transfer: %s", e)
+            raise
 
     async def get_position(self):
         """
         Asynchronously retrieves the current device position.
+        If the USB control transfer takes too long, a TimeoutError will be raised.
         """
-        raw = await self.async_ctrl_transfer(
-            REQ_TYPE_GET_INTERFACE, HID_GET_REPORT, GET_STATUS, 0, bytearray(BUF_LEN)
-        )
+        try:
+            raw = await self.async_ctrl_transfer(
+                REQ_TYPE_GET_INTERFACE, HID_GET_REPORT, GET_STATUS, 0, bytearray(BUF_LEN)
+            )
+        except asyncio.TimeoutError:
+            LOG.error("USB control transfer timed out during get_position.")
+            raise
         report = StatusReport(raw)
         LOG.debug('Position: %s, height: %.2fcm, moving: %s',
                   report.position, report.position_in_cm, report.moving)
@@ -207,6 +335,8 @@ class AsyncLinakDevice:
     async def move(self, position):
         """
         Asynchronously moves the device to the desired position.
+        This method repeatedly sends move commands and polls for the current position.
+        It stops once the desired position is reached or a retry threshold is exceeded.
         """
         retry_count = 3
         previous_position = 0
@@ -219,6 +349,8 @@ class AsyncLinakDevice:
             )
             status_report = StatusReport(raw)
             LOG.info("Current position: %s", status_report.position)
+            if position in (MOVE_UP, MOVE_DOWN, MOVE_STOP):
+                break
             if status_report.position == position:
                 break
             if previous_position == status_report.position:
@@ -246,11 +378,61 @@ class AsyncLinakDevice:
         """
         Cleanly shuts down the USB event loop thread and closes the USB context.
         """
+        LOG.debug("Shutting down Linak device...")
         self._shutdown = True
         self.event_thread.join()
-        time.sleep(1)  # Allow time for the event thread to exit
         self.handle.close()
         self.context.close()
+
+    def _convert_position_to_percent(self, position):
+        """
+        Helper method to convert a raw position value to a percentage (0-100).
+        """
+        return int((position / 6715) * 100)
+
+    async def run_loop(self, publish_callback, poll_interval=2):
+        """
+        Continuously monitors the device state.
+        Instead of directly awaiting get_position, we schedule it as a separate task
+        with a short timeout (0.5 seconds). If get_position does not complete within
+        this timeout, the poll cycle is skipped.
+        """
+        last_state = None
+        force_publish = True
+        while not self._shutdown:
+            # Sleep for the poll interval, yielding control to the event loop.
+            await asyncio.sleep(poll_interval)
+            try:
+                # Schedule get_position in its own task.
+                get_position_task = asyncio.create_task(self.get_position())
+                # Wait for get_position to finish but only for 0.5 seconds.
+                report = await asyncio.wait_for(get_position_task, timeout=0.5)
+            except asyncio.TimeoutError:
+                LOG.error("get_position task timed out; skipping this poll cycle.")
+                # Cancel the task if still running.
+                get_position_task.cancel()
+                continue
+            except Exception as e:
+                LOG.error("Error during get_position: %s", e)
+                continue
+            if report is not None:
+                # Convert the raw position to a percentage value.
+                position_percent = self._convert_position_to_percent(report.position)
+                # Check if the position has changed or if a forced publish is required.
+                if force_publish or last_state is None or position_percent != last_state:
+                    state_payload = {
+                        "position": position_percent,
+                        "raw_position": report.position,
+                        "moving": report.moving,
+                        "height": report.position_in_in,
+                        "height_cm": report.position_in_cm
+                    }
+                    LOG.info("Linak Device: State change detected, publishing new state: %s", state_payload)
+                    await publish_callback(state_payload)
+                    last_state = position_percent
+                    force_publish = False
+                else:
+                    LOG.debug("Linak Device: State unchanged (position: %s%%). Skipping publish.", position_percent)
 
 ###############################################################################
 # AsyncMQTTClient Class Using gmqtt (Asyncio-Native)
@@ -258,8 +440,6 @@ class AsyncLinakDevice:
 class AsyncMQTTClient:
     """
     An asyncio-native MQTT client built on top of gmqtt.
-    Publishes device state periodically and handles incoming commands to move the device.
-    It also publishes a discovery payload for Home Assistant integration.
     """
     def __init__(self, broker, port, device_name, async_device, username=None, password=None):
         LOG.info("Initializing AsyncMQTTClient with broker: %s, port: %s", broker, port)
@@ -273,10 +453,15 @@ class AsyncMQTTClient:
         self.broker = broker
         self.port = port
         self.async_device = async_device
+        self.payload_open = "OPEN"
+        self.payload_stop = "STOP"
+        self.payload_close = "CLOSE"
 
-        # Track last published state to avoid unnecessary updates.
         self.last_state = None
-        self.force_publish = True  # Force a state update on (re)connection.
+        self.force_publish = True  # Force a state update immediately after connection.
+
+        # NEW: Add a lock state attribute (False = unlocked, True = locked)
+        self.locked = False
 
         # This flag prevents scheduling multiple reconnect tasks concurrently.
         self.reconnecting = False
@@ -293,9 +478,11 @@ class AsyncMQTTClient:
         # Set gmqtt event callbacks.
         self.client.on_connect = self.on_connect
         self.client.on_message = self.on_message
-        # self.client.on_disconnect = self.on_disconnect
         self.client.on_subscribe = self.on_subscribe
         self.client.on_log = self.on_log
+
+        # Initialize discovery publish timestamp (for logging purposes only).
+        self._last_discovery_publish = None
 
     def on_log(self, client, level, buf):
         """
@@ -308,7 +495,9 @@ class AsyncMQTTClient:
 
     async def connect(self):
         """
-        Connect to the MQTT broker using gmqtt with a keepalive of 60 seconds.
+        Connect to the MQTT broker using gmqtt.
+        Note: The keepalive is set to 10 seconds for testing purposes.
+        This value can be increased in production but may delay detection of lost connections.
         """
         try:
             await self.client.connect(self.broker, self.port, keepalive=10)
@@ -319,47 +508,80 @@ class AsyncMQTTClient:
     def on_connect(self, client, flags, rc, properties):
         """
         Callback when the MQTT client connects or reconnects.
-        Publishes discovery and availability payloads and subscribes to the command topic.
+        Always publishes the discovery payload, subscribes to the command topic,
+        and publishes an 'online' availability payload.
         """
         LOG.info("Connected to MQTT broker with result code: %s, flags: %s, properties: %s", rc, flags, properties)
-        # Publish discovery payload for Home Assistant integration.
+        # Always publish discovery payload on connection.
         asyncio.create_task(self.publish_discovery())
-        # Subscribe to the command topic.
+        # Subscribe to both the desk command topic and the lock command topic.
         client.subscribe(self.command_topic)
-        # Publish an 'online' availability message.
+        client.subscribe("linak/desk/lock/set")
         asyncio.create_task(self.publish_availability("online"))
-        # Force a state update immediately after connection.
         self.force_publish = True
 
     async def on_message(self, client, topic, payload, qos, properties):
         """
         Callback when a message is received.
-        If the message is on the command topic, process the movement command.
+        Processes movement commands received on the command topic.
         """
         decoded_payload = payload.decode() if isinstance(payload, bytes) else payload
         LOG.info("Received message on topic %s: %s", topic, decoded_payload)
+
+        # Handle messages on the cover (desk) command topic.
         if topic == self.command_topic:
-            try:
-                position_percent = int(decoded_payload)
-                position = self.percent_to_position(position_percent)
-                LOG.info("Moving device to position: %s", position)
+            # Check if the desk is locked. If so, ignore any movement commands.
+            if self.locked:
+                LOG.warning("Movement command ignored because desk is locked.")
+                return 0  # Exit early since movement should be disabled.
+
+            if isinstance(decoded_payload, (int, float)):
+                command_value = decoded_payload
+            else:
+                try:
+                    command_value = int(decoded_payload)
+                except ValueError:
+                    command_value = decoded_payload
+
+            LOG.info("Processing movement command: %s", command_value)
+
+            if command_value == self.payload_open:
+                asyncio.create_task(self.async_device._move(MOVE_UP))
+                position = MOVE_UP
+            elif command_value == self.payload_close:
+                asyncio.create_task(self.async_device._move(MOVE_DOWN))
+                position = MOVE_DOWN
+            elif command_value == self.payload_stop:
+                asyncio.create_task(self.async_device._move(MOVE_STOP))
+                position = MOVE_STOP
+            elif isinstance(command_value, int):
+                position = self.percent_to_position(command_value)
                 asyncio.create_task(self.async_device.move(position))
-            except ValueError:
+            else:
                 LOG.error("Invalid position value received: %s", decoded_payload)
                 return 131
-        return 0
+            LOG.info("Processed movement command: %s", command_value)
 
-    def on_disconnect(self, client, packet, exc=None):
-        """
-        Callback when the client disconnects from the MQTT broker.
-        Prevents multiple reconnect attempts by checking the reconnecting flag.
-        """
-        LOG.warning("Disconnected from MQTT broker. Client: %s, Packet: %s, Exception: %s", client, packet, exc)
-        if not self.reconnecting:
-            self.reconnecting = True
-            asyncio.create_task(self.reconnect())
+        # Handle messages on the lock command topic.
+        elif topic == "linak/desk/lock/set":
+            if decoded_payload == "LOCK":
+                self.locked = True
+                LOG.info("Desk locked: Movement commands will be disabled.")
+            elif decoded_payload == "UNLOCK":
+                self.locked = False
+                LOG.info("Desk unlocked: Movement commands are now enabled.")
+            else:
+                LOG.error("Invalid lock command received: %s", decoded_payload)
+                return 131
+
+            # Publish updated lock state on the lock state topic.
+            lock_state = "LOCKED" if self.locked else "UNLOCKED"
+            self.client.publish("linak/desk/lock/state", lock_state, qos=1)
+            LOG.info("Published lock state: %s", lock_state)
+
         else:
-            LOG.debug("Reconnect already in progress; ignoring duplicate disconnect event.")
+            LOG.warning("Received message on an unrecognized topic: %s", topic)
+        return 0
 
     def on_subscribe(self, client, mid, qos, properties):
         """
@@ -367,38 +589,35 @@ class AsyncMQTTClient:
         """
         LOG.info("Subscribed to topic with mid: %s", mid)
 
-    async def reconnect(self):
-        """
-        Attempts to reconnect to the MQTT broker after a 5-second delay.
-        Only one reconnect attempt will run at a time.
-        """
-        await asyncio.sleep(5)
-        try:
-            await self.client.reconnect()
-            LOG.info("Reconnected to MQTT broker")
-        except Exception as e:
-            LOG.error("Reconnection failed: %s", e)
-            # If reconnection fails, schedule another attempt.
-            asyncio.create_task(self.reconnect())
-        finally:
-            # Reset the flag to allow future reconnect attempts if necessary.
-            self.reconnecting = False
-
     async def publish_discovery(self):
         """
         Publishes the MQTT discovery payload for Home Assistant integration.
+        This payload is now always published after connecting to the server.
         """
+        now = time.time()
+        if self._last_discovery_publish is not None:
+            interval = now - self._last_discovery_publish
+            LOG.info("Discovery payload publishing interval: %.2f seconds", interval)
+        else:
+            LOG.info("Publishing discovery payload for the first time.")
+        self._last_discovery_publish = now
+
+        # Cover discovery payload (existing)
         discovery_payload = {
             "unique_id": self.entity_id,
             "state_topic": self.state_topic,
             "state_open": 100,
             "state_closed": 0,
+            "value_template": "{{ value_json.position }}",
             "command_topic": self.command_topic,
             "availability_topic": self.availability_topic,
             "position_open": 100,
             "position_closed": 0,
             "position_topic": self.state_topic,
             "position_template": "{{ value_json.position }}",
+            "payload_open": self.payload_open,
+            "payload_stop": self.payload_stop,
+            "payload_close": self.payload_close,
             "set_position_topic": self.command_topic,
             "set_position_template": "{{ value }}",
             "json_attributes_topic": self.state_topic,
@@ -414,6 +633,31 @@ class AsyncMQTTClient:
         LOG.info("MQTT Publishing discovery payload: %s", discovery_payload)
         self.client.publish(topic, payload_json, qos=1)
 
+        # Lock discovery payload (existing, now connected to functionality)
+        discovery_payload_lock = {
+            "name": f"{self.device_name} Lock",
+            "command_topic": "linak/desk/lock/set",
+            "state_topic": "linak/desk/lock/state",
+            "payload_lock": "LOCK",
+            "payload_unlock": "UNLOCK",
+            "state_locked": "LOCKED",
+            "state_unlocked": "UNLOCKED",
+            "unique_id": "linak_lock",
+            "device": {
+                "identifiers": [self.device_name.replace(" ", "_").lower()],
+                "name": self.device_name,
+                "model": self.device_model,
+                "manufacturer": self.device_manufacturer
+            }
+        }
+        topic_lock = f"homeassistant/lock/{self.device_name.replace(' ', '_').lower()}_lock/config"
+        payload_lock_json = json.dumps(discovery_payload_lock)
+        LOG.info("MQTT Publishing discovery payload for lock: %s", discovery_payload_lock)
+        self.client.publish(topic_lock, payload_lock_json, qos=1)
+        # Publish the lock state immediately after discovery.
+        self.client.publish("linak/desk/lock/state", "UNLOCKED", qos=1)
+
+
     async def publish_availability(self, payload):
         """
         Publishes an availability message (e.g., 'online' or 'offline').
@@ -421,48 +665,19 @@ class AsyncMQTTClient:
         LOG.info("MQTT Publishing availability payload: %s", payload)
         self.client.publish(self.availability_topic, payload, qos=1, retain=True)
 
-    async def run(self):
+    async def publish_state(self, state_payload):
         """
-        Main loop that periodically retrieves the device's position and publishes it
-        to the MQTT state topic if the state has changed or a forced update is required.
+        Publishes a state payload to the configured MQTT state topic.
         """
-        while not self.async_device._shutdown:
-            try:
-                report = await self.async_device.get_position()
-                if report is not None:
-                    position_percent = self.position_to_percent(report.position)
-                    if self.force_publish or self.last_state is None or position_percent != self.last_state:
-                        state_payload = {
-                            "position": position_percent,
-                            "raw_position": report.position,
-                            "moving": report.moving,
-                            "height": report.position_in_in,
-                            "height_cm": report.position_in_cm
-                        }
-                        LOG.info("MQTT Publishing state: %s", state_payload)
-                        payload_json = json.dumps(state_payload)
-                        self.client.publish(self.state_topic, payload_json, qos=1)
-                        self.last_state = position_percent
-                        self.force_publish = False
-                    else:
-                        LOG.debug("State unchanged (position: %s). Not publishing.", position_percent)
-                else:
-                    LOG.info("Failed to get position")
-            except Exception as e:
-                LOG.error("Error getting position: %s", e)
-            await asyncio.sleep(2)
+        payload_json = json.dumps(state_payload)
+        LOG.info("MQTT Publishing state: %s", state_payload)
+        self.client.publish(self.state_topic, payload_json, qos=1)
 
     def percent_to_position(self, percent):
         """
         Converts a percentage (0-100) to a raw position value.
         """
         return int((percent / 100) * 6715)
-
-    def position_to_percent(self, position):
-        """
-        Converts a raw position value to a percentage (0-100).
-        """
-        return int((position / 6715) * 100)
 
     async def disconnect(self):
         """
@@ -480,28 +695,52 @@ async def async_main(args):
     """
     device = await AsyncLinakDevice.create(asyncio.get_running_loop())
     mqtt_client = None
+    shutdown_triggered = False
+    loop = asyncio.get_running_loop()
 
     async def signal_handler():
-        LOG.info("Received exit signal, shutting down...")
+        nonlocal shutdown_triggered
+        if shutdown_triggered:
+            return
+        shutdown_triggered = True
+        LOG.warning("Received exit signal, shutting down...")
+        # First disconnect MQTT if it exists
         if mqtt_client:
-            await mqtt_client.disconnect()
-        device.shutdown()
+            try:
+                await mqtt_client.disconnect()
+            except Exception as e:
+                LOG.error("Error during MQTT disconnect: %s", e)
+        
+        # Add a small delay to ensure MQTT operations complete
+        await asyncio.sleep(0.5)
+        
+        # Then shutdown the USB device
+        try:
+            device.shutdown()
+        except Exception as e:
+            LOG.error("Error during device shutdown: %s", e)
 
-    # Register signal handlers for graceful shutdown.
-    signal.signal(signal.SIGINT, lambda s, f: asyncio.create_task(signal_handler()))
-    signal.signal(signal.SIGTERM, lambda s, f: asyncio.create_task(signal_handler()))
+    # Use loop.add_signal_handler for clean integration with asyncio.
+    try:
+        loop.add_signal_handler(signal.SIGINT, lambda: asyncio.create_task(signal_handler()))
+        loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(signal_handler()))
+    except NotImplementedError:
+        pass
 
     try:
         if args.func == 'status':
-            await device.get_position()
+            report = await device.get_position()
+            LOG.error('Position: %s, height: %.2fcm, moving: %s',
+                      report.position, report.position_in_cm, report.moving)
         elif args.func == 'move':
             await device.move(args.position)
         elif args.func == 'mqtt':
             mqtt_client = AsyncMQTTClient(args.server, args.port, DEVICE_NAME, device, args.username, args.password)
             await mqtt_client.connect()
-            # Note: gmqtt handles incoming messages automatically once connected,
-            # so there's no need to start an explicit listener task.
-            await mqtt_client.run()
+            # Instead of awaiting run_loop, we schedule it as a background task.
+            asyncio.create_task(device.run_loop(mqtt_client.publish_state))
+            # Now wait indefinitely so that the event loop remains active.
+            await asyncio.Event().wait()
     finally:
         await signal_handler()
 
