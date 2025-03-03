@@ -93,7 +93,6 @@ class StatusReport:
 
     Note: The raw values and conversion factors have been determined through calibration.
     """
-
     def __init__(self, raw_response):
         # Determine if the device is moving (based on the 7th byte in the response)
         self.moving = raw_response[6] > 0
@@ -112,6 +111,12 @@ class AsyncLinakDevice:
     Asynchronous USB device class using libusb1’s asynchronous control transfers.
     This class now also contains a continuous run loop (via the run_loop() method) that
     monitors the device state and calls a publish callback whenever the state changes.
+
+    KEY CHANGES:
+    1. The async_ctrl_transfer method uses asyncio.wait_for to enforce a timeout.
+    2. The run_loop method now schedules get_position as a separate task with a short timeout
+       (0.5 seconds). This prevents a hanging USB call from blocking the event loop and delaying
+       MQTT ping responses.
     """
     VEND = 0x12d3
     PROD = 0x0002
@@ -168,8 +173,26 @@ class AsyncLinakDevice:
     async def async_ctrl_transfer(self, request_type, request, value, index, data, timeout=1000):
         """
         Wraps an asynchronous control transfer.
+
+        This method has been updated to include a timeout to prevent long-running USB operations
+        from blocking the main asyncio event loop and, consequently, delaying MQTT ping responses.
+
+        Parameters:
+            request_type: The USB request type.
+            request: The USB request.
+            value: The value for the request.
+            index: The index for the request.
+            data: The data buffer for the request.
+            timeout: Timeout in milliseconds (default 1000 ms).
+
+        Returns:
+            The result data from the USB control transfer.
+
+        Raises:
+            TimeoutError if the transfer does not complete within the specified timeout.
+            Exception if the transfer fails.
         """
-        start_time = time.time()  # Capture the start time
+        start_time = time.time()  # Capture the start time for logging
         future = self.loop.create_future()
         transfer = self.handle.getTransfer()
 
@@ -177,7 +200,7 @@ class AsyncLinakDevice:
             status = transfer.getStatus()
             end_time = time.time()  # Capture the end time
             duration = end_time - start_time  # Calculate the duration
-            LOG.info("USB control transfer duration: %.4f seconds", duration)  # Log the duration
+            LOG.info("USB control transfer duration: %.4f seconds", duration)
             if status == usb1.TRANSFER_COMPLETED:
                 result_data = bytes(transfer.getBuffer()[:transfer.getActualLength()])
                 self.loop.call_soon_threadsafe(future.set_result, result_data)
@@ -191,15 +214,22 @@ class AsyncLinakDevice:
             transfer.submit()
         except Exception as e:
             future.set_exception(e)
-        return await future
+
+        # Enforce a timeout on the USB transfer using asyncio.wait_for.
+        return await asyncio.wait_for(future, timeout=timeout/1000)
 
     async def get_position(self):
         """
         Asynchronously retrieves the current device position.
+        If the USB control transfer takes too long, a TimeoutError will be raised.
         """
-        raw = await self.async_ctrl_transfer(
-            REQ_TYPE_GET_INTERFACE, HID_GET_REPORT, GET_STATUS, 0, bytearray(BUF_LEN)
-        )
+        try:
+            raw = await self.async_ctrl_transfer(
+                REQ_TYPE_GET_INTERFACE, HID_GET_REPORT, GET_STATUS, 0, bytearray(BUF_LEN)
+            )
+        except asyncio.TimeoutError:
+            LOG.error("USB control transfer timed out during get_position.")
+            raise
         report = StatusReport(raw)
         LOG.debug('Position: %s, height: %.2fcm, moving: %s',
                   report.position, report.position_in_cm, report.moving)
@@ -208,6 +238,8 @@ class AsyncLinakDevice:
     async def move(self, position):
         """
         Asynchronously moves the device to the desired position.
+        This method repeatedly sends move commands and polls for the current position.
+        It will stop trying once the desired position is reached or a retry threshold is exceeded.
         """
         retry_count = 3
         previous_position = 0
@@ -251,6 +283,7 @@ class AsyncLinakDevice:
         """
         Cleanly shuts down the USB event loop thread and closes the USB context.
         """
+        LOG.debug("Shutting down Linak device...")
         self._shutdown = True
         self.event_thread.join()
         self.handle.close()
@@ -263,41 +296,55 @@ class AsyncLinakDevice:
         """
         return int((position / 6715) * 100)
 
-    async def run_loop(self, publish_callback, poll_interval=5):
+    async def run_loop(self, publish_callback, poll_interval=2):
         """
         Continuously monitors the device state.
-        This simplified loop now simply awaits the poll_interval between polls,
-        ensuring the event loop remains responsive.
+        This loop has been modified to ensure that a hanging get_position call does not block
+        the main event loop and delay MQTT ping responses.
+
+        Instead of directly awaiting get_position, we schedule it as a separate task and
+        enforce a short timeout (0.5 seconds). If get_position does not complete within
+        this timeout, the current poll cycle is skipped.
         """
         last_state = None
         force_publish = True
 
         while not self._shutdown:
+            # Sleep for the poll interval, yielding control to the event loop.
             await asyncio.sleep(poll_interval)
+
             try:
-                report = await self.get_position()
-                if report is not None:
-                    # Convert the raw position to a percentage value
-                    position_percent = self._convert_position_to_percent(report.position)
-                    # Check if the position has changed or if a forced publish is required
-                    if force_publish or last_state is None or position_percent != last_state:
-                        state_payload = {
-                            "position": position_percent,
-                            "raw_position": report.position,
-                            "moving": report.moving,
-                            "height": report.position_in_in,
-                            "height_cm": report.position_in_cm
-                        }
-                        LOG.info("Linak Device: State change detected, publishing new state: %s", state_payload)
-                        await publish_callback(state_payload)
-                        last_state = position_percent
-                        force_publish = False
-                    else:
-                        LOG.debug("Linak Device: State unchanged (position: %s%%). Skipping publish.", position_percent)
-                else:
-                    LOG.info("Linak Device: Failed to get position data.")
+                # Schedule get_position in its own task.
+                get_position_task = asyncio.create_task(self.get_position())
+                # Wait for get_position to finish but only for 0.5 seconds.
+                report = await asyncio.wait_for(get_position_task, timeout=0.5)
+            except asyncio.TimeoutError:
+                LOG.error("get_position task timed out; skipping this poll cycle.")
+                # Cancel the task if still running.
+                get_position_task.cancel()
+                continue
             except Exception as e:
-                LOG.error("Linak Device: Error in run_loop: %s", e)
+                LOG.error("Error during get_position: %s", e)
+                continue
+
+            if report is not None:
+                # Convert the raw position to a percentage value.
+                position_percent = self._convert_position_to_percent(report.position)
+                # Check if the position has changed or if a forced publish is required.
+                if force_publish or last_state is None or position_percent != last_state:
+                    state_payload = {
+                        "position": position_percent,
+                        "raw_position": report.position,
+                        "moving": report.moving,
+                        "height": report.position_in_in,
+                        "height_cm": report.position_in_cm
+                    }
+                    LOG.info("Linak Device: State change detected, publishing new state: %s", state_payload)
+                    await publish_callback(state_payload)
+                    last_state = position_percent
+                    force_publish = False
+                else:
+                    LOG.debug("Linak Device: State unchanged (position: %s%%). Skipping publish.", position_percent)
 
 ###############################################################################
 # AsyncMQTTClient Class Using gmqtt (Asyncio-Native)
@@ -357,11 +404,12 @@ class AsyncMQTTClient:
 
     async def connect(self):
         """
-        Connect to the MQTT broker using gmqtt with an increased keepalive of 60 seconds.
+        Connect to the MQTT broker using gmqtt.
+        Note: The keepalive is set to 10 seconds for testing purposes.
+        This value can be increased in production but may delay detection of lost connections.
         """
         try:
-            # Changed keepalive from 10 to 60 seconds to allow more time for PING exchanges.
-            await self.client.connect(self.broker, self.port, keepalive=60)
+            await self.client.connect(self.broker, self.port, keepalive=10)
         except Exception as e:
             LOG.error("Failed to connect to MQTT broker: %s", e)
             asyncio.create_task(self.reconnect())
