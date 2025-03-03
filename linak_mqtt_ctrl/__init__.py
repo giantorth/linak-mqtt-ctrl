@@ -46,10 +46,10 @@ class Logger:
     this logger enqueues log records and processes them on a separate thread.
     """
     def __init__(self, logger_name):
-        # Create a logger instance
+        # Create a logger instance.
         self._log = logging.getLogger(logger_name)
         self.setup_logger()
-        # Expose set_verbose for convenience
+        # Expose set_verbose for convenience.
         self._log.set_verbose = self.set_verbose
 
     def __call__(self):
@@ -103,28 +103,91 @@ class StatusReport:
     Get the status: position and movement.
 
     The raw response contains absolute position values that range from 0 to 6715.
-    The conversion to a physical measurement (in cm or inches) is based on calibration:
-      - Minimum desk height (cm): 67
-      - Minimum desk height (in): 32
-
-      - Maximum desk height (cm): 132
-      - Maximum desk height (in): 51.61
-
-    The conversion equations are:
-      - Centimeters:  position_in_cm = actual_read_position / (max_raw_range) + 67
-      - Inches:       position_in_in = (actual_read_position * 0.003856) + 25.61
-
-    Note: The raw values and conversion factors have been determined through calibration.
+    Height calculations are based on two calibration points provided during initialization.
+    
+    Example usage:
+        # Using inches
+        calibration = {
+            'unit': 'in',
+            'point1': {'raw': 0, 'height': 25.61},    # lowest position
+            'point2': {'raw': 6715, 'height': 51.61}  # highest position
+        }
+        
+        # Using centimeters
+        calibration = {
+            'unit': 'cm',
+            'point1': {'raw': 0, 'height': 67},      # lowest position
+            'point2': {'raw': 6715, 'height': 132}   # highest position
+        }
     """
-    def __init__(self, raw_response):
+    def __init__(self, raw_response, calibration=None):
+        # Default calibration if none provided (backward compatibility)
+        self._default_calibration = {
+            'unit': 'both',
+            'point1': {'raw': 0, 'height_cm': 67, 'height_in': 25.61},
+            'point2': {'raw': 6715, 'height_cm': 132, 'height_in': 51.61}
+        }
+        
+        # Set calibration data
+        self._calibration = calibration if calibration else self._default_calibration
+        
         # Determine if the device is moving (based on the 7th byte in the response)
         self.moving = raw_response[6] > 0
+        
         # Combine two bytes to form the raw position value
         self.position = raw_response[4] + (raw_response[5] << 8)
-        # Convert raw position to centimeters and inches based on calibration data
-        self.position_in_cm = self.position / 65 + 67
-        self.position_in_in = (self.position * 0.003856) + 25.61
+        
+        # Calculate heights based on calibration
+        self._calculate_heights()
+        
         LOG.info(f"Linak Position: {self.position}, Moving: {self.moving}")
+
+    def _calculate_heights(self):
+        """Calculate heights based on calibration data and current position."""
+        if self._calibration['unit'] == 'both':
+            # Using default calibration with both units
+            self.position_in_cm = self._interpolate_height(
+                self.position,
+                0, self._default_calibration['point1']['height_cm'],
+                6715, self._default_calibration['point2']['height_cm']
+            )
+            self.position_in_in = self._interpolate_height(
+                self.position,
+                0, self._default_calibration['point1']['height_in'],
+                6715, self._default_calibration['point2']['height_in']
+            )
+        else:
+            # Using custom calibration
+            height = self._interpolate_height(
+                self.position,
+                self._calibration['point1']['raw'],
+                self._calibration['point1']['height'],
+                self._calibration['point2']['raw'],
+                self._calibration['point2']['height']
+            )
+            
+            if self._calibration['unit'] == 'in':
+                self.position_in_in = height
+                self.position_in_cm = self._inches_to_cm(height)
+            else:  # cm
+                self.position_in_cm = height
+                self.position_in_in = self._cm_to_inches(height)
+
+    def _interpolate_height(self, raw_pos, raw1, height1, raw2, height2):
+        """
+        Linear interpolation between two calibration points.
+        """
+        if raw2 == raw1:
+            return height1
+        return height1 + (raw_pos - raw1) * (height2 - height1) / (raw2 - raw1)
+
+    def _inches_to_cm(self, inches):
+        """Convert inches to centimeters."""
+        return inches * 2.54
+
+    def _cm_to_inches(self, cm):
+        """Convert centimeters to inches."""
+        return cm / 2.54
 
 ###############################################################################
 # AsyncLinakDevice Class (The 'Linak' Class)
@@ -132,7 +195,7 @@ class StatusReport:
 class AsyncLinakDevice:
     """
     Asynchronous USB device class using libusb1’s asynchronous control transfers.
-    This class now also contains a continuous run loop (via the run_loop() method) that
+    This class also contains a continuous run loop (via the run_loop() method) that
     monitors the device state and calls a publish callback whenever the state changes.
 
     KEY CHANGES:
@@ -197,10 +260,9 @@ class AsyncLinakDevice:
         """
         Wraps an asynchronous control transfer.
 
-        This method has been updated to include a timeout to prevent long-running USB operations
-        from blocking the main asyncio event loop and, consequently, delaying MQTT ping responses.
-        In addition, if the wait_for times out, the underlying USB transfer is explicitly canceled,
-        freeing resources and preventing lingering transfers.
+        This method includes a timeout to prevent long-running USB operations
+        from blocking the main asyncio event loop and delaying MQTT ping responses.
+        If the timeout is exceeded, the underlying USB transfer is explicitly canceled.
 
         Parameters:
             request_type: The USB request type.
@@ -217,15 +279,15 @@ class AsyncLinakDevice:
             TimeoutError if the transfer does not complete within the specified timeout.
             Exception if the transfer fails.
         """
-        start_time = time.time()  # Capture the start time for logging
+        start_time = time.time()
         future = self.loop.create_future()
         transfer = self.handle.getTransfer()
 
         def callback(transfer):
             status = transfer.getStatus()
-            end_time = time.time()  # Capture the end time
-            duration = end_time - start_time  # Calculate the duration
-            LOG.info("USB control transfer duration: %.4f seconds", duration)
+            end_time = time.time()
+            duration = end_time - start_time
+            LOG.debug("USB control transfer duration: %.4f seconds", duration)
             if status == usb1.TRANSFER_COMPLETED:
                 result_data = bytes(transfer.getBuffer()[:transfer.getActualLength()])
                 self.loop.call_soon_threadsafe(future.set_result, result_data)
@@ -274,7 +336,7 @@ class AsyncLinakDevice:
         """
         Asynchronously moves the device to the desired position.
         This method repeatedly sends move commands and polls for the current position.
-        It will stop trying once the desired position is reached or a retry threshold is exceeded.
+        It stops once the desired position is reached or a retry threshold is exceeded.
         """
         retry_count = 3
         previous_position = 0
@@ -282,14 +344,12 @@ class AsyncLinakDevice:
         while True:
             await self._move(position)
             await asyncio.sleep(0.2)
-
             raw = await self.async_ctrl_transfer(
                 REQ_TYPE_GET_INTERFACE, HID_GET_REPORT, GET_STATUS, 0, bytearray(BUF_LEN)
             )
             status_report = StatusReport(raw)
             LOG.info("Current position: %s", status_report.position)
-
-            if position == MOVE_UP or position == MOVE_DOWN or position == MOVE_STOP:
+            if position in (MOVE_UP, MOVE_DOWN, MOVE_STOP):
                 break
             if status_report.position == position:
                 break
@@ -327,27 +387,21 @@ class AsyncLinakDevice:
     def _convert_position_to_percent(self, position):
         """
         Helper method to convert a raw position value to a percentage (0-100).
-        This conversion uses a simple linear scale based on the device's raw range.
         """
         return int((position / 6715) * 100)
 
     async def run_loop(self, publish_callback, poll_interval=2):
         """
         Continuously monitors the device state.
-        This loop has been modified to ensure that a hanging get_position call does not block
-        the main event loop and delay MQTT ping responses.
-
-        Instead of directly awaiting get_position, we schedule it as a separate task and
-        enforce a short timeout (0.5 seconds). If get_position does not complete within
-        this timeout, the current poll cycle is skipped.
+        Instead of directly awaiting get_position, we schedule it as a separate task
+        with a short timeout (0.5 seconds). If get_position does not complete within
+        this timeout, the poll cycle is skipped.
         """
         last_state = None
         force_publish = True
-
         while not self._shutdown:
             # Sleep for the poll interval, yielding control to the event loop.
             await asyncio.sleep(poll_interval)
-
             try:
                 # Schedule get_position in its own task.
                 get_position_task = asyncio.create_task(self.get_position())
@@ -361,7 +415,6 @@ class AsyncLinakDevice:
             except Exception as e:
                 LOG.error("Error during get_position: %s", e)
                 continue
-
             if report is not None:
                 # Convert the raw position to a percentage value.
                 position_percent = self._convert_position_to_percent(report.position)
@@ -613,7 +666,6 @@ async def async_main(args):
         loop.add_signal_handler(signal.SIGINT, lambda: asyncio.create_task(signal_handler()))
         loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(signal_handler()))
     except NotImplementedError:
-        # Signal handling might not be implemented on some platforms (e.g., Windows)
         pass
 
     try:
@@ -626,8 +678,10 @@ async def async_main(args):
         elif args.func == 'mqtt':
             mqtt_client = AsyncMQTTClient(args.server, args.port, DEVICE_NAME, device, args.username, args.password)
             await mqtt_client.connect()
-            # Use the device's run_loop to publish state changes via MQTT.
-            await device.run_loop(mqtt_client.publish_state)
+            # Instead of awaiting run_loop, we schedule it as a background task.
+            asyncio.create_task(device.run_loop(mqtt_client.publish_state))
+            # Now wait indefinitely so that the event loop remains active.
+            await asyncio.Event().wait()
     finally:
         await signal_handler()
 
