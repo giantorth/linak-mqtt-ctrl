@@ -112,10 +112,6 @@ class AsyncLinakDevice:
     Asynchronous USB device class using libusb1’s asynchronous control transfers.
     This class now also contains a continuous run loop (via the run_loop() method) that
     monitors the device state and calls a publish callback whenever the state changes.
-
-    The run_loop() method polls the device every few seconds (configurable by poll_interval),
-    converts the raw position to a percentage value, and then invokes the provided publish
-    callback with a JSON payload if the position (or state) has changed.
     """
     VEND = 0x12d3
     PROD = 0x0002
@@ -269,27 +265,15 @@ class AsyncLinakDevice:
 
     async def run_loop(self, publish_callback, poll_interval=5):
         """
-        This method contains the continuous run loop that monitors the device state.
-        It periodically calls get_position(), converts the raw position to a percentage,
-        and if the state has changed (or if a forced publish is requested), it calls the
-        provided publish_callback with the new state payload.
-
-        :param publish_callback: An asynchronous callback function that accepts a state
-                                 payload dictionary and publishes it via MQTT.
-        :param poll_interval: Time in seconds between successive state polls.
+        Continuously monitors the device state.
+        This simplified loop now simply awaits the poll_interval between polls,
+        ensuring the event loop remains responsive.
         """
-        # Initialize last known state and force flag to ensure an update on start.
         last_state = None
         force_publish = True
-        last_poll_time = asyncio.get_running_loop().time()
 
         while not self._shutdown:
-            current_time = asyncio.get_running_loop().time()
-            if current_time - last_poll_time < poll_interval:
-                await asyncio.sleep(0.1)
-                continue
-
-            last_poll_time = current_time
+            await asyncio.sleep(poll_interval)
             try:
                 report = await self.get_position()
                 if report is not None:
@@ -297,7 +281,6 @@ class AsyncLinakDevice:
                     position_percent = self._convert_position_to_percent(report.position)
                     # Check if the position has changed or if a forced publish is required
                     if force_publish or last_state is None or position_percent != last_state:
-                        # Prepare the state payload with detailed information
                         state_payload = {
                             "position": position_percent,
                             "raw_position": report.position,
@@ -306,9 +289,7 @@ class AsyncLinakDevice:
                             "height_cm": report.position_in_cm
                         }
                         LOG.info("Linak Device: State change detected, publishing new state: %s", state_payload)
-                        # Call the provided publish callback to publish the state via MQTT
                         await publish_callback(state_payload)
-                        # Update the last known state and reset the force flag
                         last_state = position_percent
                         force_publish = False
                     else:
@@ -341,9 +322,8 @@ class AsyncMQTTClient:
         self.payload_stop = "STOP"
         self.payload_close = "CLOSE"
 
-        # Track last published state to avoid unnecessary updates.
         self.last_state = None
-        self.force_publish = True  # Force a state update on (re)connection.
+        self.force_publish = True  # Force a state update immediately after connection.
 
         # This flag prevents scheduling multiple reconnect tasks concurrently.
         self.reconnecting = False
@@ -363,7 +343,7 @@ class AsyncMQTTClient:
         self.client.on_subscribe = self.on_subscribe
         self.client.on_log = self.on_log
 
-        # Initialize discovery publish timestamp.
+        # Initialize discovery publish timestamp (for logging purposes only).
         self._last_discovery_publish = None
 
     def on_log(self, client, level, buf):
@@ -377,10 +357,11 @@ class AsyncMQTTClient:
 
     async def connect(self):
         """
-        Connect to the MQTT broker using gmqtt with a keepalive of 60 seconds.
+        Connect to the MQTT broker using gmqtt with an increased keepalive of 60 seconds.
         """
         try:
-            await self.client.connect(self.broker, self.port, keepalive=10)
+            # Changed keepalive from 10 to 60 seconds to allow more time for PING exchanges.
+            await self.client.connect(self.broker, self.port, keepalive=60)
         except Exception as e:
             LOG.error("Failed to connect to MQTT broker: %s", e)
             asyncio.create_task(self.reconnect())
@@ -388,16 +369,14 @@ class AsyncMQTTClient:
     def on_connect(self, client, flags, rc, properties):
         """
         Callback when the MQTT client connects or reconnects.
-        Publishes discovery and availability payloads and subscribes to the command topic.
+        Always publishes the discovery payload, subscribes to the command topic,
+        and publishes an 'online' availability payload.
         """
         LOG.info("Connected to MQTT broker with result code: %s, flags: %s, properties: %s", rc, flags, properties)
-        # Publish discovery payload for Home Assistant integration.
+        # Always publish discovery payload on connection.
         asyncio.create_task(self.publish_discovery())
-        # Subscribe to the command topic.
         client.subscribe(self.command_topic)
-        # Publish an 'online' availability message.
         asyncio.create_task(self.publish_availability("online"))
-        # Force a state update immediately after connection.
         self.force_publish = True
 
     async def on_message(self, client, topic, payload, qos, properties):
@@ -407,34 +386,26 @@ class AsyncMQTTClient:
         """
         decoded_payload = payload.decode() if isinstance(payload, bytes) else payload
         if topic == self.command_topic:
-            # Process payload that might be numeric or a special command string.
             if isinstance(decoded_payload, (int, float)):
                 command_value = decoded_payload
             else:
-                # Try converting to a number, otherwise keep as string.
                 try:
                     command_value = int(decoded_payload)
                 except ValueError:
                     command_value = decoded_payload
         
-            # Log the interpreted command value.
             LOG.info("Received message on topic %s: %s", topic, command_value)
 
             if command_value == self.payload_open:
-                # Call the device to move upward
                 asyncio.create_task(self.async_device._move(MOVE_UP))
                 position = MOVE_UP
             elif command_value == self.payload_close:
-                # Call the device to move downward
                 asyncio.create_task(self.async_device._move(MOVE_DOWN))
                 position = MOVE_DOWN
             elif command_value == self.payload_stop:
-                # Call the device to stop movement
                 asyncio.create_task(self.async_device._move(MOVE_STOP))
                 position = MOVE_STOP
             elif isinstance(command_value, int):
-                # If a numeric value is received, assume it is a percentage
-                # and convert it to a raw position value.
                 position = self.percent_to_position(command_value)
                 asyncio.create_task(self.async_device.move(position))
             else:
@@ -452,6 +423,7 @@ class AsyncMQTTClient:
     async def publish_discovery(self):
         """
         Publishes the MQTT discovery payload for Home Assistant integration.
+        This payload is now always published after connecting to the server.
         """
         now = time.time()
         if self._last_discovery_publish is not None:
@@ -501,7 +473,6 @@ class AsyncMQTTClient:
     async def publish_state(self, state_payload):
         """
         Publishes a state payload to the configured MQTT state topic.
-        This method is now used by the AsyncLinakDevice run loop to push state changes.
         """
         payload_json = json.dumps(state_payload)
         LOG.info("MQTT Publishing state: %s", state_payload)
@@ -529,8 +500,8 @@ async def async_main(args):
     """
     device = await AsyncLinakDevice.create(asyncio.get_running_loop())
     mqtt_client = None
-
     shutdown_triggered = False
+    loop = asyncio.get_running_loop()
 
     async def signal_handler():
         nonlocal shutdown_triggered
@@ -545,25 +516,25 @@ async def async_main(args):
             except Exception as e:
                 LOG.error("Error during MQTT disconnect: %s", e)
 
-    # Register signal handlers for graceful shutdown.
-    signal.signal(signal.SIGINT, lambda s, f: asyncio.create_task(signal_handler()))
-    signal.signal(signal.SIGTERM, lambda s, f: asyncio.create_task(signal_handler()))
+    # Use loop.add_signal_handler for clean integration with asyncio.
+    try:
+        loop.add_signal_handler(signal.SIGINT, lambda: asyncio.create_task(signal_handler()))
+        loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(signal_handler()))
+    except NotImplementedError:
+        # Signal handling might not be implemented on some platforms (e.g., Windows)
+        pass
 
     try:
         if args.func == 'status':
-            # Simply query the current position and log it.
             report = await device.get_position()
             LOG.error('Position: %s, height: %.2fcm, moving: %s',
                       report.position, report.position_in_cm, report.moving)
         elif args.func == 'move':
-            # Command the device to move to a specific raw position.
             await device.move(args.position)
         elif args.func == 'mqtt':
-            # Create and connect the MQTT client.
             mqtt_client = AsyncMQTTClient(args.server, args.port, DEVICE_NAME, device, args.username, args.password)
             await mqtt_client.connect()
-            # Instead of having MQTT continuously poll the state, we now call the run_loop on the device.
-            # The run_loop method accepts the MQTT client's publish_state() as a callback.
+            # Use the device's run_loop to publish state changes via MQTT.
             await device.run_loop(mqtt_client.publish_state)
     finally:
         await signal_handler()
