@@ -460,6 +460,9 @@ class AsyncMQTTClient:
         self.last_state = None
         self.force_publish = True  # Force a state update immediately after connection.
 
+        # NEW: Add a lock state attribute (False = unlocked, True = locked)
+        self.locked = False
+
         # This flag prevents scheduling multiple reconnect tasks concurrently.
         self.reconnecting = False
 
@@ -511,7 +514,9 @@ class AsyncMQTTClient:
         LOG.info("Connected to MQTT broker with result code: %s, flags: %s, properties: %s", rc, flags, properties)
         # Always publish discovery payload on connection.
         asyncio.create_task(self.publish_discovery())
+        # Subscribe to both the desk command topic and the lock command topic.
         client.subscribe(self.command_topic)
+        client.subscribe("linak/desk/lock/set")
         asyncio.create_task(self.publish_availability("online"))
         self.force_publish = True
 
@@ -521,7 +526,15 @@ class AsyncMQTTClient:
         Processes movement commands received on the command topic.
         """
         decoded_payload = payload.decode() if isinstance(payload, bytes) else payload
+        LOG.info("Received message on topic %s: %s", topic, decoded_payload)
+
+        # Handle messages on the cover (desk) command topic.
         if topic == self.command_topic:
+            # Check if the desk is locked. If so, ignore any movement commands.
+            if self.locked:
+                LOG.warning("Movement command ignored because desk is locked.")
+                return 0  # Exit early since movement should be disabled.
+
             if isinstance(decoded_payload, (int, float)):
                 command_value = decoded_payload
             else:
@@ -529,8 +542,8 @@ class AsyncMQTTClient:
                     command_value = int(decoded_payload)
                 except ValueError:
                     command_value = decoded_payload
-        
-            LOG.info("Received message on topic %s: %s", topic, command_value)
+
+            LOG.info("Processing movement command: %s", command_value)
 
             if command_value == self.payload_open:
                 asyncio.create_task(self.async_device._move(MOVE_UP))
@@ -548,6 +561,26 @@ class AsyncMQTTClient:
                 LOG.error("Invalid position value received: %s", decoded_payload)
                 return 131
             LOG.info("Processed movement command: %s", command_value)
+
+        # Handle messages on the lock command topic.
+        elif topic == "linak/desk/lock/set":
+            if decoded_payload == "LOCK":
+                self.locked = True
+                LOG.info("Desk locked: Movement commands will be disabled.")
+            elif decoded_payload == "UNLOCK":
+                self.locked = False
+                LOG.info("Desk unlocked: Movement commands are now enabled.")
+            else:
+                LOG.error("Invalid lock command received: %s", decoded_payload)
+                return 131
+
+            # Publish updated lock state on the lock state topic.
+            lock_state = "LOCKED" if self.locked else "UNLOCKED"
+            self.client.publish("linak/desk/lock/state", lock_state, qos=1)
+            LOG.info("Published lock state: %s", lock_state)
+
+        else:
+            LOG.warning("Received message on an unrecognized topic: %s", topic)
         return 0
 
     def on_subscribe(self, client, mid, qos, properties):
@@ -569,6 +602,7 @@ class AsyncMQTTClient:
             LOG.info("Publishing discovery payload for the first time.")
         self._last_discovery_publish = now
 
+        # Cover discovery payload (existing)
         discovery_payload = {
             "unique_id": self.entity_id,
             "state_topic": self.state_topic,
@@ -598,6 +632,31 @@ class AsyncMQTTClient:
         payload_json = json.dumps(discovery_payload)
         LOG.info("MQTT Publishing discovery payload: %s", discovery_payload)
         self.client.publish(topic, payload_json, qos=1)
+
+        # Lock discovery payload (existing, now connected to functionality)
+        discovery_payload_lock = {
+            "name": f"{self.device_name} Lock",
+            "command_topic": "linak/desk/lock/set",
+            "state_topic": "linak/desk/lock/state",
+            "payload_lock": "LOCK",
+            "payload_unlock": "UNLOCK",
+            "state_locked": "LOCKED",
+            "state_unlocked": "UNLOCKED",
+            "unique_id": "linak_lock",
+            "device": {
+                "identifiers": [self.device_name.replace(" ", "_").lower()],
+                "name": self.device_name,
+                "model": self.device_model,
+                "manufacturer": self.device_manufacturer
+            }
+        }
+        topic_lock = f"homeassistant/lock/{self.device_name.replace(' ', '_').lower()}_lock/config"
+        payload_lock_json = json.dumps(discovery_payload_lock)
+        LOG.info("MQTT Publishing discovery payload for lock: %s", discovery_payload_lock)
+        self.client.publish(topic_lock, payload_lock_json, qos=1)
+        # Publish the lock state immediately after discovery.
+        self.client.publish("linak/desk/lock/state", "UNLOCKED", qos=1)
+
 
     async def publish_availability(self, payload):
         """
