@@ -4,8 +4,8 @@ setuptools.setup(
     name="linak-mqtt-ctrl",
     version="0.1.0",
     description="A utility to interact with USB2LIN06 device asynchronously using libusb1 and gmqtt.",
-    author="Your Name",
-    author_email="your.email@example.com",
+    author="Ryan Orth",
+    author_email="giantorth@gmail.com",
     url="https://github.com/giantorth/linak-mqtt-ctrl",
     packages=setuptools.find_packages(),
     install_requires=[
@@ -25,6 +25,4 @@ setuptools.setup(
     python_requires='>=3.7',
     setup_requires=['pbr>=2.0.0'],
     pbr=True,
-    description_file='README.md',
-    home_page='https://github.com/giantorth/linak-mqtt-ctrl',
 )

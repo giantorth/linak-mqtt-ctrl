@@ -9,6 +9,7 @@ import usb1  # Using libusb1 for asynchronous USB transfers
 import time
 import queue
 import os
+import yaml  # NEW: YAML support for config file
 from logging.handlers import QueueHandler, QueueListener
 
 # Import gmqtt for asyncio-native MQTT communication.
@@ -858,11 +859,10 @@ def main():
     parser_move.set_defaults(func='move')
 
     parser_mqtt = subparsers.add_parser('mqtt', help='Run in MQTT mode.')
-    parser_mqtt.add_argument('--server', required=True, help='MQTT server address')
+    parser_mqtt.add_argument('--server', help='MQTT server address')
     parser_mqtt.add_argument('--port', type=int, default=1883, help='MQTT server port')
     parser_mqtt.add_argument('--username', help='MQTT username')
     parser_mqtt.add_argument('--password', help='MQTT password')
-    # New daemon flag for Linux
     parser_mqtt.add_argument('--daemon', action='store_true', help='Run in daemon mode (Linux only)')
     parser_mqtt.set_defaults(func='mqtt')
 
@@ -872,12 +872,29 @@ def main():
 
     args = parser.parse_args()
 
-    # If --daemon is specified when starting in mqtt mode, daemonize on Linux.
-    if args.func == 'mqtt' and args.daemon:
-        if sys.platform.startswith('linux'):
-            daemonize()  # Detach from terminal and run in background.
+    # NEW: Load MQTT config options from /etc/linakdesk/config.yaml if present
+    if args.func == 'mqtt':
+        config_file = "/etc/linakdesk/config.yaml"
+        if os.path.exists(config_file):
+            try:
+                with open(config_file, 'r') as f:
+                    config = yaml.safe_load(f)
+                args.server = args.server or config.get("server")
+                args.port = args.port or config.get("port", args.port)
+                args.username = args.username or config.get("username")
+                args.password = args.password or config.get("password")
+                print(f"Loaded MQTT config from {config_file}")
+            except Exception as e:
+                LOG.error("Error loading config file: %s", e)
         else:
-            print("--daemon option is only supported on Linux; continuing in normal mode.")
+            LOG.info("Config file %s not found, using command line arguments", config_file)
+        
+        # Process daemon option only if running in MQTT mode
+        if args.daemon:
+            if sys.platform.startswith('linux'):
+                daemonize()  # Detach process on Linux only.
+            else:
+                print("--daemon option is only supported on Linux; continuing in normal mode.")
 
     LOG.set_verbose(args.verbose, args.quiet)
     asyncio.run(async_main(args))
