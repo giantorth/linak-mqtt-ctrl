@@ -84,8 +84,11 @@ class Logger:
         # Create a QueueHandler that will send log records to the queue.
         queue_handler = QueueHandler(log_queue)
         self._log.addHandler(queue_handler)
+        # Disable propagation to avoid duplicate log messages.
+        self._log.propagate = False   
         # Create a StreamHandler that writes to sys.stderr.
         stream_handler = logging.StreamHandler(sys.stderr)
+        # Set the formatter for the stream handler.
         stream_handler.setFormatter(logging.Formatter("%(message)s"))
         # Create a QueueListener that will listen to the queue and dispatch records to stream_handler.
         listener = QueueListener(log_queue, stream_handler)
@@ -236,6 +239,10 @@ class AsyncLinakDevice:
                 handle.detachKernelDriver(0)
         except Exception as e:
             LOG.debug("Could not detach kernel driver: %s", e)
+        
+        # Claim interface 0
+        handle.claimInterface(0)
+        
         device = cls(context, handle, loop)
         await device._init_device()
         return device

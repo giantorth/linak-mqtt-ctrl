@@ -1,3 +1,4 @@
+
 server: "mqtt.example.com"
 port: 1883
 username: "your_username"
