@@ -1,0 +1,27 @@
+# Byte-compiled / optimized 
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage reports
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Virtual Environments
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Package build artifacts
+*.egg-info/
+.eggs/
+build/
+dist/
+install.log

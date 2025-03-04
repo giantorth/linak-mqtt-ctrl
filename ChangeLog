@@ -1,0 +1,37 @@
+CHANGES
+=======
+
+* First with config
+* Initial daemon mode
+* Cleaner exit, fixed non-mqtt command output
+* Fixed up/down button control
+* Added desk lock controls
+* Now with configurable height output logic
+* Now with async logging too
+* More changes
+* Now with more stable MQTT connection
+* Moved run loop to usb side
+* Output shutdown message
+* Less bugs
+* Squash
+* Updated readme
+* Complete rewrite to use asyncio
+* Split into multiple files.  Still buggy with MQTT connection
+* Update readme
+* First commit with raw MQTT support
+* Readme update
+* Make the package instead of bare module
+* Fix typo in the url
+* Cover case when no device has been found
+* Readme update
+* Detach kernel driver before doing anything with device
+* DRY. Simplifying get\_status method
+* Added installation bits
+* Added initialization part
+* Rearranged argument parsing
+* Handle keyboard interrupt exception for status with loop
+* Changed param name from height to position for consistency
+* Added usage section
+* Added linak\_ctrl module
+* Added README
+* Added license

@@ -1,3 +1,4 @@
-pbr==5.11.1
+pbr
 libusb1
 gmqtt
+pyyaml
