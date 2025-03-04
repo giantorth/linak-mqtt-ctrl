@@ -6,9 +6,9 @@ import threading
 import json
 import asyncio
 import usb1  # Using libusb1 for asynchronous USB transfers
-import signal
 import time
 import queue
+import os
 from logging.handlers import QueueHandler, QueueListener
 
 # Import gmqtt for asyncio-native MQTT communication.
@@ -341,6 +341,10 @@ class AsyncLinakDevice:
         """
         retry_count = 3
         previous_position = 0
+
+        if position < DESK_MIN_TRAVEL: 
+            position = DESK_MIN_TRAVEL
+
         LOG.info("Moving to position: %s", position)
         while True:
             await self._move(position)
@@ -366,6 +370,9 @@ class AsyncLinakDevice:
         """
         Helper method to send the MOVE command to USB.
         """
+        if position < DESK_MIN_TRAVEL:
+            position = DESK_MIN_TRAVEL
+
         buf = bytearray(BUF_LEN)
         pos = f"{position:04x}"  # Convert position to a 4-digit hex string
         pos_l = int(pos[2:], 16)
@@ -500,11 +507,9 @@ class AsyncMQTTClient:
     async def connect(self):
         """
         Connect to the MQTT broker using gmqtt.
-        Note: The keepalive is set to 10 seconds for testing purposes.
-        This value can be increased in production but may delay detection of lost connections.
         """
         try:
-            await self.client.connect(self.broker, self.port, keepalive=10)
+            await self.client.connect(self.broker, self.port, keepalive=60)
         except Exception as e:
             LOG.error("Failed to connect to MQTT broker: %s", e)
             asyncio.create_task(self.reconnect())
@@ -667,7 +672,7 @@ class AsyncMQTTClient:
 
         # Lock discovery payload
         discovery_payload_lock = {
-            "name": f"{self.device_name} Lock",
+            "name": f"Lock",
             "command_topic": "linak/desk/lock/set",
             "state_topic": "linak/desk/lock/state",
             "payload_lock": "LOCK",
@@ -804,8 +809,44 @@ async def async_main(args):
 ###############################################################################
 # Main Function and Argument Parsing
 ###############################################################################
+def daemonize():
+    """Perform the UNIX double-fork magic to daemonize the process."""
+    try:
+        # First fork
+        pid = os.fork()
+        if pid > 0:
+            sys.exit(0)
+    except OSError as e:
+        sys.stderr.write(f"Fork #1 failed: {e.errno} ({e.strerror})\n")
+        sys.exit(1)
+
+    os.chdir("/")
+    os.setsid()
+    os.umask(0)
+
+    try:
+        # Second fork
+        pid = os.fork()
+        if pid > 0:
+            sys.exit(0)
+    except OSError as e:
+        sys.stderr.write(f"Fork #2 failed: {e.errno} ({e.strerror})\n")
+        sys.exit(1)
+
+    # Redirect standard file descriptors.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    with open('/dev/null', 'r') as si:
+        os.dup2(si.fileno(), sys.stdin.fileno())
+    with open('/dev/null', 'a+') as so:
+        os.dup2(so.fileno(), sys.stdout.fileno())
+    with open('/dev/null', 'a+') as se:
+        os.dup2(se.fileno(), sys.stderr.fileno())
+
 def main():
-    parser = argparse.ArgumentParser('A utility to interact with USB2LIN06 device asynchronously using libusb1 and gmqtt.')
+    parser = argparse.ArgumentParser(
+        'A utility to interact with USB2LIN06 device asynchronously using libusb1 and gmqtt.'
+    )
     subparsers = parser.add_subparsers(help='supported commands', dest='subcommand')
     subparsers.required = True
 
@@ -821,6 +862,8 @@ def main():
     parser_mqtt.add_argument('--port', type=int, default=1883, help='MQTT server port')
     parser_mqtt.add_argument('--username', help='MQTT username')
     parser_mqtt.add_argument('--password', help='MQTT password')
+    # New daemon flag for Linux
+    parser_mqtt.add_argument('--daemon', action='store_true', help='Run in daemon mode (Linux only)')
     parser_mqtt.set_defaults(func='mqtt')
 
     group = parser.add_mutually_exclusive_group()
@@ -828,6 +871,14 @@ def main():
     group.add_argument("-v", "--verbose", help='Increase verbosity', action="count", default=0)
 
     args = parser.parse_args()
+
+    # If --daemon is specified when starting in mqtt mode, daemonize on Linux.
+    if args.func == 'mqtt' and args.daemon:
+        if sys.platform.startswith('linux'):
+            daemonize()  # Detach from terminal and run in background.
+        else:
+            print("--daemon option is only supported on Linux; continuing in normal mode.")
+
     LOG.set_verbose(args.verbose, args.quiet)
     asyncio.run(async_main(args))
 
