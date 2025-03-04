@@ -672,7 +672,7 @@ class AsyncMQTTClient:
             "json_attributes_topic": self.state_topic,
             "device": {
                 "identifiers": [self.device_name.replace(" ", "_").lower()],
-                "name": self.device_name,
+                "name": self.device_manufacturer,
                 "model": self.device_model,
                 "manufacturer": self.device_manufacturer
             }
@@ -694,7 +694,7 @@ class AsyncMQTTClient:
             "unique_id": "linak_lock",
             "device": {
                 "identifiers": [self.device_name.replace(" ", "_").lower()],
-                "name": self.device_name,
+                "name": self.device_manufacturer,
                 "model": self.device_model,
                 "manufacturer": self.device_manufacturer
             }

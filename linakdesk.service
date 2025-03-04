@@ -3,15 +3,14 @@ Description=Linak Desk Service
 After=network.target
 
 [Service]
-# Use "simple" because script runs in the foreground.
-Type=simple
+Type=forking
 User=linakdesk
 Group=linakdesk
 
 # Set the working directory to where code is located.
-WorkingDirectory=/path/to/your/application
-# Start the service in MQTT mode. Adjust the MQTT server, port, and any other parameters as needed.
-ExecStart=/usr/bin/env python3 /path/to/your/application/__init__.py mqtt --server your.mqtt.server --port 1883
+WorkingDirectory=/usr/local/bin
+# Start the service in MQTT daemon mode. 
+ExecStart=/usr/local/bin/linak-mqtt-ctrl mqtt --daemon
 # Restart the service automatically if it crashes.
 Restart=always
 RestartSec=10

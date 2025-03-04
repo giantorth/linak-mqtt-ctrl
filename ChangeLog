@@ -1,18 +1,9 @@
 CHANGES
 =======
 
-* First with config
-* Initial daemon mode
-* Cleaner exit, fixed non-mqtt command output
-* Fixed up/down button control
-* Added desk lock controls
-* Now with configurable height output logic
-* Now with async logging too
-* More changes
-* Now with more stable MQTT connection
-* Moved run loop to usb side
-* Output shutdown message
-* Less bugs
+* Update readme, fix usb and logger bug
+* Now with yaml config and package building
+* Lots of updates (#2)
 * Squash
 * Updated readme
 * Complete rewrite to use asyncio
