@@ -11,6 +11,7 @@ setuptools.setup(
     install_requires=[
         "gmqtt>=0.6.8",
         "libusb1>=1.9.3",
+        "pyyaml"
     ],
     entry_points={
         'console_scripts': [
