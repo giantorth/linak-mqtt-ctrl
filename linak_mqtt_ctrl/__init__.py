@@ -10,6 +10,7 @@ import time
 import queue
 import os
 import yaml  # NEW: YAML support for config file
+
 from logging.handlers import QueueHandler, QueueListener
 
 # Import gmqtt for asyncio-native MQTT communication.
@@ -119,6 +120,7 @@ class StatusReport:
         calibration = {
             'unit': 'cm',
             'point1': {'raw': 0, 'height': 67},      # lowest position
+
             'point2': {'raw': DESK_MAX_HEIGHT, 'height': 132}   # highest position
         }
     """
@@ -127,6 +129,7 @@ class StatusReport:
         self._default_calibration = {
             'unit': 'both',
             'point1': {'raw': 0, 'height_cm': 67, 'height_in': 25.61},
+
             'point2': {'raw': DESK_MAX_HEIGHT, 'height_cm': 132, 'height_in': 51.61}
         }
         
@@ -151,6 +154,7 @@ class StatusReport:
             self.position_in_cm = self._interpolate_height(
                 self.position,
                 0, self._default_calibration['point1']['height_cm'],
+
                 DESK_MAX_HEIGHT, self._default_calibration['point2']['height_cm']
             )
             self.position_in_in = self._interpolate_height(
@@ -694,6 +698,31 @@ class AsyncMQTTClient:
         self.client.publish(topic_lock, payload_lock_json, qos=1, retain=True)
         # Publish the lock state immediately after discovery.
         self.client.publish("linak/desk/lock/state", "UNLOCKED", qos=1)
+
+        # Lock discovery payload (existing, now connected to functionality)
+        discovery_payload_lock = {
+            "name": f"{self.device_name} Lock",
+            "command_topic": "linak/desk/lock/set",
+            "state_topic": "linak/desk/lock/state",
+            "payload_lock": "LOCK",
+            "payload_unlock": "UNLOCK",
+            "state_locked": "LOCKED",
+            "state_unlocked": "UNLOCKED",
+            "unique_id": "linak_lock",
+            "device": {
+                "identifiers": [self.device_name.replace(" ", "_").lower()],
+                "name": self.device_name,
+                "model": self.device_model,
+                "manufacturer": self.device_manufacturer
+            }
+        }
+        topic_lock = f"homeassistant/lock/{self.device_name.replace(' ', '_').lower()}_lock/config"
+        payload_lock_json = json.dumps(discovery_payload_lock)
+        LOG.info("MQTT Publishing discovery payload for lock: %s", discovery_payload_lock)
+        self.client.publish(topic_lock, payload_lock_json, qos=1)
+        # Publish the lock state immediately after discovery.
+        self.client.publish("linak/desk/lock/state", "UNLOCKED", qos=1)
+
 
     async def publish_availability(self, payload):
         """
