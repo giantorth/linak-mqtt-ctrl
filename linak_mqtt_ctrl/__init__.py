@@ -42,6 +42,9 @@ DEVICE_NAME = "Standing Desk"
 DESK_MAX_HEIGHT = 6715
 DESK_MIN_TRAVEL = 1550
 
+# Define the path to the configuration file which holds MQTT config and presets.
+CONFIG_FILE = "/etc/linakdesk/config.yaml"
+
 ###############################################################################
 # Asynchronous Logger Setup Using QueueHandler/QueueListener
 ###############################################################################
@@ -126,7 +129,6 @@ class StatusReport:
         calibration = {
             'unit': 'cm',
             'point1': {'raw': 0, 'height': 67},      # lowest position
-
             'point2': {'raw': DESK_MAX_HEIGHT, 'height': 132}   # highest position
         }
     """
@@ -135,7 +137,6 @@ class StatusReport:
         self._default_calibration = {
             'unit': 'both',
             'point1': {'raw': 0, 'height_cm': 67, 'height_in': 25.61},
-
             'point2': {'raw': DESK_MAX_HEIGHT, 'height_cm': 132, 'height_in': 51.61}
         }
         
@@ -160,7 +161,6 @@ class StatusReport:
             self.position_in_cm = self._interpolate_height(
                 self.position,
                 0, self._default_calibration['point1']['height_cm'],
-
                 DESK_MAX_HEIGHT, self._default_calibration['point2']['height_cm']
             )
             self.position_in_in = self._interpolate_height(
@@ -541,13 +541,17 @@ class AsyncMQTTClient:
         # Subscribe to both the desk command topic and the lock command topic.
         client.subscribe(self.command_topic)
         client.subscribe("linak/desk/lock/set")
+        # NEW: Subscribe to preset commands for both 'go' and 'set'
+        client.subscribe("linak/desk/preset/+/go")
+        client.subscribe("linak/desk/preset/+/set")
         asyncio.create_task(self.publish_availability("online"))
         self.force_publish = True
 
     async def on_message(self, client, topic, payload, qos, properties):
         """
         Callback when a message is received.
-        Processes movement commands received on the command topic.
+        Processes movement commands received on the command topic,
+        lock commands, and the newly added preset commands.
         """
         decoded_payload = payload.decode() if isinstance(payload, bytes) else payload
         LOG.info("Received message on topic %s: %s", topic, decoded_payload)
@@ -612,6 +616,28 @@ class AsyncMQTTClient:
             self.client.publish("linak/desk/lock/state", lock_state, qos=1)
             LOG.info("Published lock state: %s", lock_state)
 
+        # NEW: Handle preset commands (both "set" and "go").
+        # The expected topic format is: "linak/desk/preset/<preset_number>/<command>"
+        elif topic.startswith("linak/desk/preset/"):
+            parts = topic.split('/')
+            # Ensure the topic has the proper format (should have at least 5 parts)
+            if len(parts) < 5:
+                LOG.error("Invalid preset command topic format: %s", topic)
+                return
+            preset_number = parts[3]
+            command = parts[4]
+            # Validate that the preset number is one of the allowed values (1-4)
+            if preset_number not in ["1", "2", "3", "4"]:
+                LOG.error("Invalid preset number: %s", preset_number)
+                return
+            if command == "set":
+                # Call the method to record the current position to the config file.
+                await self.set_preset(preset_number)
+            elif command == "go":
+                # Call the method to move the desk to the preset position.
+                await self.go_to_preset(preset_number)
+            else:
+                LOG.error("Unknown preset command: %s", command)
         else:
             LOG.warning("Received message on an unrecognized topic: %s", topic)
         return 0
@@ -799,6 +825,97 @@ class AsyncMQTTClient:
             except asyncio.CancelledError:
                 LOG.info("Button repeat task cancelled during cleanup.")
 
+    # -------------------------------------------------------------------------
+    # New helper methods for preset functionality (recording and using presets)
+    # -------------------------------------------------------------------------
+
+    def load_config(self):
+        """
+        Synchronously loads the configuration from CONFIG_FILE.
+        Returns:
+            A dictionary with the configuration data. If the file does not exist,
+            returns an empty dictionary.
+        """
+        try:
+            if os.path.exists(CONFIG_FILE):
+                with open(CONFIG_FILE, 'r') as f:
+                    # Load YAML data; if the file is empty, use an empty dict.
+                    config = yaml.safe_load(f) or {}
+                LOG.debug("Configuration loaded from %s: %s", CONFIG_FILE, config)
+                return config
+            else:
+                LOG.info("Configuration file %s does not exist. Using empty config.", CONFIG_FILE)
+                return {}
+        except Exception as e:
+            LOG.error("Error reading configuration file %s: %s", CONFIG_FILE, e)
+            return {}
+
+    def save_config(self, config):
+        """
+        Synchronously saves the given configuration dictionary to CONFIG_FILE.
+        Parameters:
+            config (dict): The configuration data to save.
+        """
+        try:
+            with open(CONFIG_FILE, 'w') as f:
+                yaml.safe_dump(config, f)
+            LOG.debug("Configuration saved to %s: %s", CONFIG_FILE, config)
+        except Exception as e:
+            LOG.error("Error saving configuration file %s: %s", CONFIG_FILE, e)
+
+    async def set_preset(self, preset_number):
+        """
+        Records the current desk position as a preset in the configuration file.
+        This method retrieves the current raw position from the device and saves it
+        under a key (e.g., 'preset1') in CONFIG_FILE.
+        Parameters:
+            preset_number (str): The preset number as a string (e.g., "1").
+        """
+        try:
+            # Retrieve the current desk position asynchronously.
+            report = await self.async_device.get_position()
+            current_position = report.position
+            LOG.info("Current position retrieved for preset %s: %s", preset_number, current_position)
+            # Load the current configuration in a separate thread to avoid blocking.
+            config = await asyncio.to_thread(self.load_config)
+            # Update the configuration with the new preset value.
+            config[f"preset{preset_number}"] = current_position
+            # Save the updated configuration back to the file.
+            await asyncio.to_thread(self.save_config, config)
+            LOG.info("Preset %s set to position %s and saved to %s", preset_number, current_position, CONFIG_FILE)
+        except Exception as e:
+            LOG.error("Error setting preset %s: %s", preset_number, e)
+
+    async def go_to_preset(self, preset_number):
+        """
+        Commands the desk to move to a preset position as defined in the configuration file.
+        This method loads the configuration, reads the preset value for the given preset number,
+        and then instructs the device to move to that position.
+        Parameters:
+            preset_number (str): The preset number as a string (e.g., "1").
+        """
+        # Check if the desk is locked; if so, ignore preset movement commands.
+        if self.locked:
+            LOG.warning("Preset movement command ignored because desk is locked.")
+            return
+        try:
+            # Load the configuration from the file.
+            config = await asyncio.to_thread(self.load_config)
+            preset_key = f"preset{preset_number}"
+            if preset_key not in config:
+                LOG.error("Preset %s not found in configuration file %s.", preset_number, CONFIG_FILE)
+                return
+            target_position = config[preset_key]
+            LOG.info("Moving desk to preset %s position: %s", preset_number, target_position)
+            # Command the device to move to the target position.
+            asyncio.create_task(self.async_device.move(target_position))
+        except Exception as e:
+            LOG.error("Error executing preset %s command: %s", preset_number, e)
+
+    # -------------------------------------------------------------------------
+    # End of new preset helper methods.
+    # -------------------------------------------------------------------------
+
 ###############################################################################
 # Main Async Entry Point and Signal Handling
 ###############################################################################
@@ -939,7 +1056,7 @@ def main():
 
     # NEW: Load MQTT config options from /etc/linakdesk/config.yaml if present
     if args.func == 'mqtt':
-        config_file = "/etc/linakdesk/config.yaml"
+        config_file = CONFIG_FILE
         if os.path.exists(config_file):
             try:
                 with open(config_file, 'r') as f:
