@@ -202,6 +202,8 @@ class AsyncLinakDevice:
     2. If a USB control transfer times out, the underlying USB transfer is explicitly canceled.
     3. The run_loop method schedules get_position as a separate task with a short timeout,
        ensuring that a hanging USB call does not block the event loop and delay MQTT ping responses.
+    4. NEW: A global stop flag (_stop_requested) is added so that a stop command halts all movement,
+       regardless of whether it is a repeating button command or a move-to-position command.
     """
     VEND = 0x12d3
     PROD = 0x0002
@@ -211,6 +213,7 @@ class AsyncLinakDevice:
         self.handle = handle
         self.loop = loop
         self._shutdown = False
+        self._stop_requested = False  # NEW: Flag to indicate that a stop command was issued.
         # Start a dedicated thread to process USB events.
         self.event_thread = threading.Thread(target=self._handle_events_loop, daemon=True)
         self.event_thread.start()
@@ -339,8 +342,10 @@ class AsyncLinakDevice:
         """
         Asynchronously moves the device to the desired position.
         This method repeatedly sends move commands and polls for the current position.
-        It stops once the desired position is reached or a retry threshold is exceeded.
+        It stops once the desired position is reached, a retry threshold is exceeded,
+        or a stop command has been requested.
         """
+        self._stop_requested = False  # Reset stop flag at the beginning of a move command.
         retry_count = 3
         previous_position = 0
 
@@ -348,7 +353,7 @@ class AsyncLinakDevice:
             position = DESK_MIN_TRAVEL
 
         LOG.info("Moving to position: %s", position)
-        while True:
+        while not self._stop_requested:
             await self._move(position)
             await asyncio.sleep(0.2)
             raw = await self.async_ctrl_transfer(
@@ -356,6 +361,10 @@ class AsyncLinakDevice:
             )
             status_report = StatusReport(raw)
             LOG.info("Current position: %s", status_report.position)
+            # Check if a stop has been requested during the loop.
+            if self._stop_requested:
+                LOG.info("Stop requested, halting move loop.")
+                break
             if position in (MOVE_UP, MOVE_DOWN, MOVE_STOP):
                 break
             if status_report.position == position:
@@ -367,6 +376,8 @@ class AsyncLinakDevice:
             if retry_count == 0:
                 LOG.debug("Retry threshold reached. Stopping move.")
                 break
+        # After exiting the loop, ensure that a stop command is sent.
+        await self._move(MOVE_STOP)
 
     async def _move(self, position):
         """
@@ -383,6 +394,16 @@ class AsyncLinakDevice:
         buf[1] = buf[3] = buf[5] = buf[7] = pos_l
         buf[2] = buf[4] = buf[6] = buf[8] = pos_h
         await self.async_ctrl_transfer(REQ_TYPE_SET_INTERFACE, HID_SET_REPORT, MOVE, 0, buf)
+
+    async def stop_movement(self):
+        """
+        NEW: Halts any ongoing movement commands.
+        This method sets the stop requested flag and sends the stop command to the device,
+        ensuring that all movement is halted immediately.
+        """
+        LOG.info("Stop command received: setting stop flag and sending stop command.")
+        self._stop_requested = True
+        await self._move(MOVE_STOP)
 
     def shutdown(self):
         """
@@ -561,22 +582,28 @@ class AsyncMQTTClient:
             LOG.info("Processing movement command: %s", command_value)
 
             if command_value == self.payload_open:
+                self.async_device._stop_requested = False
                 # Cancel any existing repeating task before starting a new one.
                 if self._button_repeat_task:
                     self._button_repeat_task.cancel()
                 self._button_repeat_task = asyncio.create_task(self._repeat_button(MOVE_UP))
             elif command_value == self.payload_close:
+                self.async_device._stop_requested = False
                 if self._button_repeat_task:
                     self._button_repeat_task.cancel()
                 self._button_repeat_task = asyncio.create_task(self._repeat_button(MOVE_DOWN))
             elif command_value == self.payload_stop:
-                # Cancel any active repeating move.
+                # Cancel any active repeating move task.
                 if self._button_repeat_task:
                     self._button_repeat_task.cancel()
                     self._button_repeat_task = None
-                asyncio.create_task(self.async_device._move(MOVE_STOP))
+                # NEW: Instead of just sending a MOVE_STOP command once,
+                # call the stop_movement() method to ensure all movement is halted.
+                asyncio.create_task(self.async_device.stop_movement())
             elif isinstance(command_value, int):
                 position = self.percent_to_position(command_value)
+                # When moving to a specific position, a separate move task is created.
+                # (If needed, you could also store and cancel this task similar to _button_repeat_task.)
                 asyncio.create_task(self.async_device.move(position))
             else:
                 LOG.error("Invalid position value received: %s", decoded_payload)
@@ -629,10 +656,12 @@ class AsyncMQTTClient:
     async def _repeat_button(self, move_command):
         """
         Repeatedly sends the given move_command every 0.3 seconds.
-        Runs until cancelled (e.g. when a MOVE_STOP arrives) or when the desk reaches its limits.
+        Runs until cancelled (e.g. when a MOVE_STOP arrives), when the desk reaches its limits,
+        or when a stop command has been requested.
         """
         try:
-            while True:
+            # NEW: Check the device's stop flag to break the loop if a stop is requested.
+            while not self.async_device._stop_requested:
                 await self.async_device._move(move_command)
                 report = await self.async_device.get_position()
                 # Check if the desk has reached its lower or upper limit.

@@ -18,14 +18,14 @@ else
     useradd --system --no-create-home --shell /usr/sbin/nologin linakdesk
 fi
 
-# Checking if linak-mqtt-service is running
-echo "Checking status of linak-mqtt-service..."
-if systemctl is-active --quiet linak-mqtt-service; then
-    echo "linak-mqtt-service is running. Stopping it..."
-    systemctl stop linak-mqtt-service
-    echo "linak-mqtt-service has been stopped."
+# Checking if linakdesk.service is running
+echo "Checking status of linakdesk.service..."
+if systemctl is-active --quiet linakdesk.service; then
+    echo "linakdesk.service is running. Stopping it..."
+    systemctl stop linakdesk.service
+    echo "linakdesk.service has been stopped."
 else
-    echo "linak-mqtt-service is not running."
+    echo "linakdesk.service is not running."
 fi
 
 # Build and install the Python package
