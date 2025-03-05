@@ -565,19 +565,16 @@ class AsyncMQTTClient:
                 if self._button_repeat_task:
                     self._button_repeat_task.cancel()
                 self._button_repeat_task = asyncio.create_task(self._repeat_button(MOVE_UP))
-                position = MOVE_UP
             elif command_value == self.payload_close:
                 if self._button_repeat_task:
                     self._button_repeat_task.cancel()
                 self._button_repeat_task = asyncio.create_task(self._repeat_button(MOVE_DOWN))
-                position = MOVE_DOWN
             elif command_value == self.payload_stop:
                 # Cancel any active repeating move.
                 if self._button_repeat_task:
                     self._button_repeat_task.cancel()
                     self._button_repeat_task = None
                 asyncio.create_task(self.async_device._move(MOVE_STOP))
-                position = MOVE_STOP
             elif isinstance(command_value, int):
                 position = self.percent_to_position(command_value)
                 asyncio.create_task(self.async_device.move(position))
