@@ -135,9 +135,9 @@ class StatusReport:
     def __init__(self, raw_response, calibration=None):
         # Default calibration if none provided (backward compatibility)
         self._default_calibration = {
-            'unit': 'both',
-            'point1': {'raw': 0, 'height_cm': 67, 'height_in': 25.61},
-            'point2': {'raw': DESK_MAX_HEIGHT, 'height_cm': 132, 'height_in': 51.61}
+            'unit': 'in',
+            'point1': {'raw': 0, 'height': 25.61},
+            'point2': {'raw': DESK_MAX_HEIGHT, 'height': 51.61}
         }
         
         # Set calibration data
@@ -156,34 +156,21 @@ class StatusReport:
 
     def _calculate_heights(self):
         """Calculate heights based on calibration data and current position."""
-        if self._calibration['unit'] == 'both':
-            # Using default calibration with both units
-            self.position_in_cm = self._interpolate_height(
-                self.position,
-                0, self._default_calibration['point1']['height_cm'],
-                DESK_MAX_HEIGHT, self._default_calibration['point2']['height_cm']
-            )
-            self.position_in_in = self._interpolate_height(
-                self.position,
-                0, self._default_calibration['point1']['height_in'],
-                DESK_MAX_HEIGHT, self._default_calibration['point2']['height_in']
-            )
-        else:
-            # Using custom calibration
-            height = self._interpolate_height(
-                self.position,
-                self._calibration['point1']['raw'],
-                self._calibration['point1']['height'],
-                self._calibration['point2']['raw'],
-                self._calibration['point2']['height']
-            )
-            
-            if self._calibration['unit'] == 'in':
-                self.position_in_in = height
-                self.position_in_cm = self._inches_to_cm(height)
-            else:  # cm
-                self.position_in_cm = height
-                self.position_in_in = self._cm_to_inches(height)
+        # Using custom calibration
+        height = self._interpolate_height(
+            self.position,
+            self._calibration['point1']['raw'],
+            self._calibration['point1']['height'],
+            self._calibration['point2']['raw'],
+            self._calibration['point2']['height']
+        )
+        
+        if self._calibration['unit'] == 'in':
+            self.position_in_in = round(height, 2)
+            self.position_in_cm = round(self._inches_to_cm(height), 2)
+        else:  # cm
+            self.position_in_cm = round(height, 2)
+            self.position_in_in = round(self._cm_to_inches(height), 2)
 
     def _interpolate_height(self, raw_pos, raw1, height1, raw2, height2):
         """
@@ -686,6 +673,9 @@ class AsyncMQTTClient:
                 "sw_version": __version__,
                 "support_url": "https://github.com/giantorth/linak-mqtt-ctrl"
             },
+            "availability": {
+                "topic": self.availability_topic,
+            },
             "components": {
                 "standing_desk": {
                     "platform": "cover",
@@ -693,7 +683,6 @@ class AsyncMQTTClient:
                     "unique_id": self.entity_id,
                     "state_topic": self.state_topic,
                     "command_topic": self.command_topic,
-                    "availability_topic": self.availability_topic,
                     "state_open": 100,
                     "state_closed": 0,
                     "value_template": "{{ value_json.position }}",
@@ -771,6 +760,15 @@ class AsyncMQTTClient:
                     "unique_id": f"{self.entity_id}_set_preset4",
                     "command_topic": "linak/desk/preset/4/set",
                     "entity_category": "config"
+                },
+                "desk_height": {   # New sensor component for desk height (in inches)
+                    "platform": "sensor",
+                    "name": "Desk Height",
+                    "unique_id": f"{self.entity_id}_height",
+                    "state_topic": self.state_topic,
+                    "value_template": "{{ value_json.height }}",
+                    "unit_of_measurement": "in",
+                    "icon": "mdi:arrow-expand-vertical"
                 }
             },
             "state_topic": self.state_topic,
@@ -824,10 +822,6 @@ class AsyncMQTTClient:
                 await self._button_repeat_task
             except asyncio.CancelledError:
                 LOG.info("Button repeat task cancelled during cleanup.")
-
-    # -------------------------------------------------------------------------
-    # New helper methods for preset functionality (recording and using presets)
-    # -------------------------------------------------------------------------
 
     def load_config(self):
         """
@@ -911,10 +905,6 @@ class AsyncMQTTClient:
             asyncio.create_task(self.async_device.move(target_position))
         except Exception as e:
             LOG.error("Error executing preset %s command: %s", preset_number, e)
-
-    # -------------------------------------------------------------------------
-    # End of new preset helper methods.
-    # -------------------------------------------------------------------------
 
 ###############################################################################
 # Main Async Entry Point and Signal Handling
