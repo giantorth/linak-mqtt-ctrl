@@ -44,7 +44,6 @@ The project is built using setuptools. To build the package, simply run:
 
 .. code:: shell-session
 
-   $ pip build .
    $ pip install .
 
 The build configuration is defined in [setup.py](setup.py) and [setup.cfg](setup.cfg).
@@ -69,6 +68,7 @@ Adjust the desk height by specifying an absolute position (range: 0-6715):
    $ linak-mqtt-ctrl move 1000
 
 Increase verbosity for debugging:
+
 .. code:: shell-session
 
    $ linak-mqtt-ctrl -v move 1000
@@ -80,6 +80,7 @@ The ``mqtt`` command allows the script to run continuously in service mode,
 publishing Home Assistant autodiscovery messages.
 
 Basic usage:
+
 .. code:: shell-session
 
    $ linak-mqtt-ctrl mqtt --server <MQTT_SERVER> --port <MQTT_PORT> --username <MQTT_USERNAME> --password <MQTT_PASSWORD>
@@ -115,6 +116,7 @@ reloads the systemd configuration, and starts the service. It also adds a udev r
 non-root access to the USB device.
 
 Uninstall or stop the service using standard systemd commands:
+
 .. code:: shell-session
 
    $ sudo systemctl stop linakdesk.service
