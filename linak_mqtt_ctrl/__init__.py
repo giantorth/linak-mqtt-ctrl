@@ -31,7 +31,6 @@ GET_STATUS = 0x0304
 BUF_LEN = 64
 MODE_OF_OPERATION = 0x03
 MODE_OF_OPERATION_DEFAULT = 0x04
-
 # USB Button commands
 MOVE_DOWN = 32767
 MOVE_UP = 32768
@@ -40,7 +39,7 @@ MOVE_STOP = 32769
 # MQTT and device constants
 DEVICE_NAME = "Standing Desk"
 DESK_MAX_HEIGHT = 6715
-DESK_MIN_TRAVEL = 1550
+DESK_MIN_TRAVEL = 0
 
 # Define the path to the configuration file which holds MQTT config and presets.
 CONFIG_FILE = "/etc/linakdesk/config.yaml"
@@ -213,7 +212,8 @@ class AsyncLinakDevice:
         self.handle = handle
         self.loop = loop
         self._shutdown = False
-        self._stop_requested = False  # NEW: Flag to indicate that a stop command was issued.
+        self._stop_requested = False  
+        self.min_travel = DESK_MIN_TRAVEL
         # Start a dedicated thread to process USB events.
         self.event_thread = threading.Thread(target=self._handle_events_loop, daemon=True)
         self.event_thread.start()
@@ -237,8 +237,20 @@ class AsyncLinakDevice:
         handle.claimInterface(0)
         
         device = cls(context, handle, loop)
-        await device._init_device()
-        return device
+
+        # New: Load desk_min_travel from config file
+        config_file = CONFIG_FILE
+        if os.path.exists(config_file):
+            try:
+                with open(config_file, 'r') as f:
+                    config = yaml.safe_load(f) or {}
+                device.min_travel = config.get("desk_min_travel", DESK_MIN_TRAVEL)
+                LOG.info("Loaded desk_min_travel from config: %s", device.min_travel)
+            except Exception as e:
+                LOG.error("Error loading config file: %s", e)
+
+            await device._init_device()
+            return device
 
     async def _init_device(self):
         """
@@ -349,8 +361,8 @@ class AsyncLinakDevice:
         retry_count = 3
         previous_position = 0
 
-        if position < DESK_MIN_TRAVEL: 
-            position = DESK_MIN_TRAVEL
+        if position < self.min_travel:  # use device attribute now
+            position = self.min_travel
 
         LOG.info("Moving to position: %s", position)
         while not self._stop_requested:
@@ -383,8 +395,8 @@ class AsyncLinakDevice:
         """
         Helper method to send the MOVE command to USB.
         """
-        if position < DESK_MIN_TRAVEL:
-            position = DESK_MIN_TRAVEL
+        if position < self.min_travel:  # use device attribute now
+            position = self.min_travel
 
         buf = bytearray(BUF_LEN)
         pos = f"{position:04x}"  # Convert position to a 4-digit hex string
@@ -552,6 +564,9 @@ class AsyncMQTTClient:
         # NEW: Subscribe to preset commands for both 'go' and 'set'
         client.subscribe("linak/desk/preset/+/go")
         client.subscribe("linak/desk/preset/+/set")
+        client.subscribe("linak/desk/desk_min_travel/set")
+        # NEW: Publish desk_min_travel state on startup.
+        self.client.publish("linak/desk/desk_min_travel/state", str(self.async_device.min_travel), qos=1)
         asyncio.create_task(self.publish_availability("online"))
         self.force_publish = True
 
@@ -649,6 +664,21 @@ class AsyncMQTTClient:
                 await self.go_to_preset(preset_number)
             else:
                 LOG.error("Unknown preset command: %s", command)
+        # NEW: Handle messages to set the desk_min_travel value.
+        elif topic == "linak/desk/desk_min_travel/set":
+            try:
+                new_min = int(decoded_payload)
+                self.async_device.min_travel = new_min
+                LOG.info("Updated desk_min_travel to: %s", new_min)
+                # Load config, update desk_min_travel, and save it.
+                config = self.load_config()
+                config["desk_min_travel"] = new_min
+                self.save_config(config)
+                # Publish updated state on the state topic.
+                self.client.publish("linak/desk/desk_min_travel/state", str(new_min), qos=1)
+            except ValueError:
+                LOG.error("Invalid desk_min_travel value received: %s", decoded_payload)
+                return 131
         else:
             LOG.warning("Received message on an unrecognized topic: %s", topic)
         return 0
@@ -657,15 +687,16 @@ class AsyncMQTTClient:
         """
         Repeatedly sends the given move_command every 0.3 seconds.
         Runs until cancelled (e.g. when a MOVE_STOP arrives), when the desk reaches its limits,
-        or when a stop command has been requested.
+        or when a stop command has been requested.1
         """
+        config = self.load_config()
         try:
             # NEW: Check the device's stop flag to break the loop if a stop is requested.
             while not self.async_device._stop_requested:
                 await self.async_device._move(move_command)
                 report = await self.async_device.get_position()
                 # Check if the desk has reached its lower or upper limit.
-                if report.position <= 0 or report.position >= DESK_MAX_HEIGHT:
+                if report.position <= (config["desk_min_travel"] + 200) or report.position >= DESK_MAX_HEIGHT:
                     LOG.info("Desk reached limit (%s). Cancelling repeating move command.", report.position)
                     break
                 await asyncio.sleep(0.3)
@@ -795,9 +826,23 @@ class AsyncMQTTClient:
                     "value_template": "{{ value_json.height }}",
                     "unit_of_measurement": "in",
                     "icon": "mdi:arrow-expand-vertical"
+                },
+                "desk_min_travel": {
+                    "platform": "number",
+                    "name": "Desk Min Travel",
+                    "unique_id": f"{self.entity_id}_min_travel",
+                    "state_topic": "linak/desk/desk_min_travel/state",
+                    "command_topic": "linak/desk/desk_min_travel/set",
+                    "min": 0,
+                    "max": DESK_MAX_HEIGHT,
+                    "step": 1,
+                    "unit_of_measurement": "raw",
+                    "icon": "mdi:arrow-collapse-down",
+                    "entity_category": "config"
                 }
             },
-            "state_topic": self.state_topic,
+            # "state_topic": self.state_topic,
+            # "value_template": "{{ value_json.position }}",
             "qos": 1
         }
 
@@ -854,21 +899,24 @@ class AsyncMQTTClient:
         Synchronously loads the configuration from CONFIG_FILE.
         Returns:
             A dictionary with the configuration data. If the file does not exist,
-            returns an empty dictionary.
+            returns a dictionary with desk_min_travel set to DESK_MIN_TRAVEL.
         """
         try:
             if os.path.exists(CONFIG_FILE):
                 with open(CONFIG_FILE, 'r') as f:
                     # Load YAML data; if the file is empty, use an empty dict.
                     config = yaml.safe_load(f) or {}
-                LOG.debug("Configuration loaded from %s: %s", CONFIG_FILE, config)
-                return config
             else:
                 LOG.info("Configuration file %s does not exist. Using empty config.", CONFIG_FILE)
-                return {}
+                config = {}
+
+            # Ensure that desk_min_travel is always present in the config.
+            config.setdefault("desk_min_travel", DESK_MIN_TRAVEL)
+            LOG.debug("Configuration loaded from %s: %s", CONFIG_FILE, config)
+            return config
         except Exception as e:
             LOG.error("Error reading configuration file %s: %s", CONFIG_FILE, e)
-            return {}
+            return {"desk_min_travel": DESK_MIN_TRAVEL}
 
     def save_config(self, config):
         """
@@ -877,6 +925,9 @@ class AsyncMQTTClient:
             config (dict): The configuration data to save.
         """
         try:
+            # Ensure desk_min_travel is saved
+            if "desk_min_travel" not in config:
+                config["desk_min_travel"] = DESK_MIN_TRAVEL
             with open(CONFIG_FILE, 'w') as f:
                 yaml.safe_dump(config, f)
             LOG.debug("Configuration saved to %s: %s", CONFIG_FILE, config)
