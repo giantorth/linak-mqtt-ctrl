@@ -10,7 +10,7 @@ Group=linakdesk
 # Set the working directory to where code is located.
 WorkingDirectory=/usr/local/bin
 # Start the service in MQTT daemon mode. 
-ExecStart=/usr/local/bin/linak-mqtt-ctrl mqtt --daemon
+ExecStart=/usr/local/bin/linak-mqtt-ctrl mqtt
 # Restart the service automatically if it crashes.
 Restart=always
 RestartSec=10
