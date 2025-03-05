@@ -1,15 +1,18 @@
 #!/usr/bin/env python
+
+__version__ = "1.0.0"
+
 import argparse
 import logging
 import sys
 import threading
 import json
 import asyncio
-import usb1  # Using libusb1 for asynchronous USB transfers
+import usb1
 import time
 import queue
 import os
-import yaml  # NEW: YAML support for config file
+import yaml
 
 from logging.handlers import QueueHandler, QueueListener
 
@@ -639,97 +642,123 @@ class AsyncMQTTClient:
 
     async def publish_discovery(self):
         """
-        Publishes the MQTT discovery payload for Home Assistant integration.
-        This payload is now always published after connecting to the server.
+        Publishes a combined MQTT discovery payload for Home Assistant integration,
+        containing multiple components (cover, lock, preset buttons, and set preset buttons)
+        for a single device.
         """
-        now = time.time()
-        if self._last_discovery_publish is not None:
-            interval = now - self._last_discovery_publish
-            LOG.info("Discovery payload publishing interval: %.2f seconds", interval)
-        else:
-            LOG.info("Publishing discovery payload for the first time.")
-        self._last_discovery_publish = now
-
-        # Cover discovery payload
+    
         discovery_payload = {
-            "name": self.device_name,
-            "unique_id": self.entity_id,
-            "state_topic": self.state_topic,
-            "state_open": 100,
-            "state_closed": 0,
-            "value_template": "{{ value_json.position }}",
-            "command_topic": self.command_topic,
-            "availability_topic": self.availability_topic,
-            "position_open": 100,
-            "position_closed": 0,
-            "position_topic": self.state_topic,
-            "position_template": "{{ value_json.position }}",
-            "payload_open": self.payload_open,
-            "payload_stop": self.payload_stop,
-            "payload_close": self.payload_close,
-            "set_position_topic": self.command_topic,
-            "set_position_template": "{{ value }}",
-            "json_attributes_topic": self.state_topic,
             "device": {
                 "identifiers": [self.device_name.replace(" ", "_").lower()],
-                "name": self.device_manufacturer,
+                "name": self.device_manufacturer + " Desk",
+                "manufacturer": self.device_manufacturer,
                 "model": self.device_model,
-                "manufacturer": self.device_manufacturer
-            }
+                "sw_version": __version__
+            },
+            "origin": {
+                "name": self.device_manufacturer,
+                "sw_version": __version__,
+                "support_url": "https://github.com/giantorth/linak-mqtt-ctrl"
+            },
+            "components": {
+                "standing_desk": {
+                    "platform": "cover",
+                    "name": self.device_name,
+                    "unique_id": self.entity_id,
+                    "state_topic": self.state_topic,
+                    "command_topic": self.command_topic,
+                    "availability_topic": self.availability_topic,
+                    "state_open": 100,
+                    "state_closed": 0,
+                    "value_template": "{{ value_json.position }}",
+                    "position_open": 100,
+                    "position_closed": 0,
+                    "position_topic": self.state_topic,
+                    "position_template": "{{ value_json.position }}",
+                    "payload_open": self.payload_open,
+                    "payload_stop": self.payload_stop,
+                    "payload_close": self.payload_close,
+                    "set_position_topic": self.command_topic,
+                    "set_position_template": "{{ value }}",
+                    "json_attributes_topic": self.state_topic,
+                    "icon": "mdi:table-furniture"
+                },
+                "desk_lock": {
+                    "platform": "lock",
+                    "name": "Desk Lock",
+                    "unique_id": f"{self.entity_id}_lock",
+                    "command_topic": "linak/desk/lock/set",
+                    "state_topic": "linak/desk/lock/state",
+                    "payload_lock": "LOCK",
+                    "payload_unlock": "UNLOCK",
+                    "state_locked": "LOCKED",
+                    "state_unlocked": "UNLOCKED"
+                },
+                "preset_button_1": {
+                    "platform": "button",
+                    "name": "Preset 1",
+                    "unique_id": f"{self.entity_id}_preset1",
+                    "command_topic": "linak/desk/preset/1/go"
+                },
+                "preset_button_2": {
+                    "platform": "button",
+                    "name": "Preset 2",
+                    "unique_id": f"{self.entity_id}_preset2",
+                    "command_topic": "linak/desk/preset/2/go"
+                },
+                "preset_button_3": {
+                    "platform": "button",
+                    "name": "Preset 3",
+                    "unique_id": f"{self.entity_id}_preset3",
+                    "command_topic": "linak/desk/preset/3/go"
+                },
+                "preset_button_4": {
+                    "platform": "button",
+                    "name": "Preset 4",
+                    "unique_id": f"{self.entity_id}_preset4",
+                    "command_topic": "linak/desk/preset/4/go"
+                },
+                "set_preset_button_1": {
+                    "platform": "button",
+                    "name": "Set Preset 1",
+                    "unique_id": f"{self.entity_id}_set_preset1",
+                    "command_topic": "linak/desk/preset/1/set",
+                    "entity_category": "config"
+                },
+                "set_preset_button_2": {
+                    "platform": "button",
+                    "name": "Set Preset 2",
+                    "unique_id": f"{self.entity_id}_set_preset2",
+                    "command_topic": "linak/desk/preset/2/set",
+                    "entity_category": "config"
+                },
+                "set_preset_button_3": {
+                    "platform": "button",
+                    "name": "Set Preset 3",
+                    "unique_id": f"{self.entity_id}_set_preset3",
+                    "command_topic": "linak/desk/preset/3/set",
+                    "entity_category": "config"
+                },
+                "set_preset_button_4": {
+                    "platform": "button",
+                    "name": "Set Preset 4",
+                    "unique_id": f"{self.entity_id}_set_preset4",
+                    "command_topic": "linak/desk/preset/4/set",
+                    "entity_category": "config"
+                }
+            },
+            "state_topic": self.state_topic,
+            "qos": 1
         }
-        topic = f"homeassistant/cover/{self.device_name.replace(' ', '_').lower()}/config"
+
+        topic = f"homeassistant/device/{self.device_name.replace(' ', '_').lower()}/config"
         payload_json = json.dumps(discovery_payload)
         LOG.info("MQTT Publishing discovery payload: %s", discovery_payload)
         self.client.publish(topic, payload_json, qos=1, retain=True)
-
-        # Lock discovery payload
-        discovery_payload_lock = {
-            "name": f"Lock",
-            "command_topic": "linak/desk/lock/set",
-            "state_topic": "linak/desk/lock/state",
-            "payload_lock": "LOCK",
-            "payload_unlock": "UNLOCK",
-            "state_locked": "LOCKED",
-            "state_unlocked": "UNLOCKED",
-            "unique_id": "linak_lock",
-            "device": {
-                "identifiers": [self.device_name.replace(" ", "_").lower()],
-                "name": self.device_manufacturer,
-                "model": self.device_model,
-                "manufacturer": self.device_manufacturer
-            }
-        }
-        topic_lock = f"homeassistant/lock/{self.device_name.replace(' ', '_').lower()}_lock/config"
-        payload_lock_json = json.dumps(discovery_payload_lock)
-        LOG.info("MQTT Publishing discovery payload for lock: %s", discovery_payload_lock)
-        self.client.publish(topic_lock, payload_lock_json, qos=1, retain=True)
         # Publish the lock state immediately after discovery.
         self.client.publish("linak/desk/lock/state", "UNLOCKED", qos=1)
-
-        # Lock discovery payload (existing, now connected to functionality)
-        discovery_payload_lock = {
-            "name": f"{self.device_name} Lock",
-            "command_topic": "linak/desk/lock/set",
-            "state_topic": "linak/desk/lock/state",
-            "payload_lock": "LOCK",
-            "payload_unlock": "UNLOCK",
-            "state_locked": "LOCKED",
-            "state_unlocked": "UNLOCKED",
-            "unique_id": "linak_lock",
-            "device": {
-                "identifiers": [self.device_name.replace(" ", "_").lower()],
-                "name": self.device_name,
-                "model": self.device_model,
-                "manufacturer": self.device_manufacturer
-            }
-        }
-        topic_lock = f"homeassistant/lock/{self.device_name.replace(' ', '_').lower()}_lock/config"
-        payload_lock_json = json.dumps(discovery_payload_lock)
-        LOG.info("MQTT Publishing discovery payload for lock: %s", discovery_payload_lock)
-        self.client.publish(topic_lock, payload_lock_json, qos=1)
-        # Publish the lock state immediately after discovery.
-        self.client.publish("linak/desk/lock/state", "UNLOCKED", qos=1)
-
+        # Home assistant seems to read the set value immediately after discovery.
+        self.client.publish("linak/desk/lock/set", "UNLOCK", qos=1)
 
     async def publish_availability(self, payload):
         """
