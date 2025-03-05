@@ -13,6 +13,7 @@ import time
 import queue
 import os
 import yaml
+import signal
 
 from logging.handlers import QueueHandler, QueueListener
 
@@ -249,8 +250,8 @@ class AsyncLinakDevice:
             except Exception as e:
                 LOG.error("Error loading config file: %s", e)
 
-            await device._init_device()
-            return device
+        await device._init_device()
+        return device
 
     async def _init_device(self):
         """
@@ -552,21 +553,20 @@ class AsyncMQTTClient:
     def on_connect(self, client, flags, rc, properties):
         """
         Callback when the MQTT client connects or reconnects.
-        Always publishes the discovery payload, subscribes to the command topic,
-        and publishes an 'online' availability payload.
+        We now ensure that the autodiscovery payload is sent first and then
+        all state information (desk state, lock state, desk height, and desk min travel)
+        is published immediately after.
         """
         LOG.info("Connected to MQTT broker with result code: %s, flags: %s, properties: %s", rc, flags, properties)
-        # Always publish discovery payload on connection.
-        asyncio.create_task(self.publish_discovery())
-        # Subscribe to both the desk command topic and the lock command topic.
+        # Schedule a task that publishes the autodiscovery payload and then all state information.
+        asyncio.create_task(self.publish_discovery_and_state())
+        # Subscribe to topics for movement, lock, and preset commands.
         client.subscribe(self.command_topic)
         client.subscribe("linak/desk/lock/set")
-        # NEW: Subscribe to preset commands for both 'go' and 'set'
         client.subscribe("linak/desk/preset/+/go")
         client.subscribe("linak/desk/preset/+/set")
         client.subscribe("linak/desk/desk_min_travel/set")
-        # NEW: Publish desk_min_travel state on startup.
-        self.client.publish("linak/desk/desk_min_travel/state", str(self.async_device.min_travel), qos=1)
+        # Publish availability message.
         asyncio.create_task(self.publish_availability("online"))
         self.force_publish = True
 
@@ -618,7 +618,6 @@ class AsyncMQTTClient:
             elif isinstance(command_value, int):
                 position = self.percent_to_position(command_value)
                 # When moving to a specific position, a separate move task is created.
-                # (If needed, you could also store and cancel this task similar to _button_repeat_task.)
                 asyncio.create_task(self.async_device.move(position))
             else:
                 LOG.error("Invalid position value received: %s", decoded_payload)
@@ -643,24 +642,19 @@ class AsyncMQTTClient:
             LOG.info("Published lock state: %s", lock_state)
 
         # NEW: Handle preset commands (both "set" and "go").
-        # The expected topic format is: "linak/desk/preset/<preset_number>/<command>"
         elif topic.startswith("linak/desk/preset/"):
             parts = topic.split('/')
-            # Ensure the topic has the proper format (should have at least 5 parts)
             if len(parts) < 5:
                 LOG.error("Invalid preset command topic format: %s", topic)
                 return
             preset_number = parts[3]
             command = parts[4]
-            # Validate that the preset number is one of the allowed values (1-4)
             if preset_number not in ["1", "2", "3", "4"]:
                 LOG.error("Invalid preset number: %s", preset_number)
                 return
             if command == "set":
-                # Call the method to record the current position to the config file.
                 await self.set_preset(preset_number)
             elif command == "go":
-                # Call the method to move the desk to the preset position.
                 await self.go_to_preset(preset_number)
             else:
                 LOG.error("Unknown preset command: %s", command)
@@ -670,11 +664,9 @@ class AsyncMQTTClient:
                 new_min = int(decoded_payload)
                 self.async_device.min_travel = new_min
                 LOG.info("Updated desk_min_travel to: %s", new_min)
-                # Load config, update desk_min_travel, and save it.
                 config = self.load_config()
                 config["desk_min_travel"] = new_min
                 self.save_config(config)
-                # Publish updated state on the state topic.
                 self.client.publish("linak/desk/desk_min_travel/state", str(new_min), qos=1)
             except ValueError:
                 LOG.error("Invalid desk_min_travel value received: %s", decoded_payload)
@@ -686,12 +678,11 @@ class AsyncMQTTClient:
     async def _repeat_button(self, move_command):
         """
         Repeatedly sends the given move_command every 0.3 seconds.
-        Runs until cancelled (e.g. when a MOVE_STOP arrives), when the desk reaches its limits,
-        or when a stop command has been requested.1
+        Runs until cancelled, the desk reaches its limits, or a stop command is requested.
         """
         config = self.load_config()
         try:
-            # NEW: Check the device's stop flag to break the loop if a stop is requested.
+            # Check the device's stop flag to break the loop if a stop is requested.
             while not self.async_device._stop_requested:
                 await self.async_device._move(move_command)
                 report = await self.async_device.get_position()
@@ -713,10 +704,10 @@ class AsyncMQTTClient:
     async def publish_discovery(self):
         """
         Publishes a combined MQTT discovery payload for Home Assistant integration,
-        containing multiple components (cover, lock, preset buttons, and set preset buttons)
-        for a single device.
+        containing definitions for the cover (desk), lock, preset buttons, and more.
+        NOTE: We have removed immediate state publications from here so that state is
+        published after this payload is sent.
         """
-    
         discovery_payload = {
             "device": {
                 "identifiers": [self.device_name.replace(" ", "_").lower()],
@@ -818,7 +809,7 @@ class AsyncMQTTClient:
                     "command_topic": "linak/desk/preset/4/set",
                     "entity_category": "config"
                 },
-                "desk_height": {   # New sensor component for desk height (in inches)
+                "desk_height": {
                     "platform": "sensor",
                     "name": "Desk Height",
                     "unique_id": f"{self.entity_id}_height",
@@ -841,19 +832,60 @@ class AsyncMQTTClient:
                     "entity_category": "config"
                 }
             },
-            # "state_topic": self.state_topic,
-            # "value_template": "{{ value_json.position }}",
             "qos": 1
         }
 
         topic = f"homeassistant/device/{self.device_name.replace(' ', '_').lower()}/config"
         payload_json = json.dumps(discovery_payload)
         LOG.info("MQTT Publishing discovery payload: %s", discovery_payload)
+        # Publish the autodiscovery payload with retain flag so that Home Assistant can pick it up.
         self.client.publish(topic, payload_json, qos=1, retain=True)
-        # Publish the lock state immediately after discovery.
-        self.client.publish("linak/desk/lock/state", "UNLOCKED", qos=1)
-        # Home assistant seems to read the set value immediately after discovery.
-        self.client.publish("linak/desk/lock/set", "UNLOCK", qos=1)
+    
+    async def publish_all_state(self):
+        """
+        Publishes all device states after the autodiscovery payload is sent.
+        This includes:
+          - Desk state (position, raw position, moving, height in inches and cm)
+          - Lock state (LOCKED or UNLOCKED)
+          - Desk min travel state
+        A small delay is added to ensure the autodiscovery payload is fully processed.
+        """
+        # Wait briefly to ensure autodiscovery is processed by Home Assistant.
+        await asyncio.sleep(0.5)
+
+        # Publish desk state by querying the current device position.
+        try:
+            report = await self.async_device.get_position()
+            position_percent = self.percent_to_position(report.position)
+            state_payload = {
+                "position": position_percent,
+                "raw_position": report.position,
+                "moving": report.moving,
+                "height": report.position_in_in,
+                "height_cm": report.position_in_cm
+            }
+            LOG.info("Publishing desk state: %s", state_payload)
+            await self.publish_state(state_payload)
+        except Exception as e:
+            LOG.error("Error retrieving desk state: %s", e)
+        
+        # Publish lock state.
+        lock_state = "LOCKED" if self.locked else "UNLOCKED"
+        LOG.info("Publishing lock state: %s", lock_state)
+        self.client.publish("linak/desk/lock/state", lock_state, qos=1)
+        
+        # Publish desk min travel state.
+        min_travel = str(self.async_device.min_travel)
+        LOG.info("Publishing desk min travel state: %s", min_travel)
+        self.client.publish("linak/desk/desk_min_travel/state", min_travel, qos=1)
+
+    async def publish_discovery_and_state(self):
+        """
+        Helper method that first publishes the autodiscovery payload and then
+        publishes all device state information.
+        """
+        await self.publish_discovery()
+        await self.publish_all_state()
 
     async def publish_availability(self, payload):
         """
@@ -898,8 +930,7 @@ class AsyncMQTTClient:
         """
         Synchronously loads the configuration from CONFIG_FILE.
         Returns:
-            A dictionary with the configuration data. If the file does not exist,
-            returns a dictionary with desk_min_travel set to DESK_MIN_TRAVEL.
+            A dictionary with the configuration data.
         """
         try:
             if os.path.exists(CONFIG_FILE):
@@ -937,21 +968,15 @@ class AsyncMQTTClient:
     async def set_preset(self, preset_number):
         """
         Records the current desk position as a preset in the configuration file.
-        This method retrieves the current raw position from the device and saves it
-        under a key (e.g., 'preset1') in CONFIG_FILE.
         Parameters:
-            preset_number (str): The preset number as a string (e.g., "1").
+            preset_number (str): The preset number (e.g., "1").
         """
         try:
-            # Retrieve the current desk position asynchronously.
             report = await self.async_device.get_position()
             current_position = report.position
             LOG.info("Current position retrieved for preset %s: %s", preset_number, current_position)
-            # Load the current configuration in a separate thread to avoid blocking.
             config = await asyncio.to_thread(self.load_config)
-            # Update the configuration with the new preset value.
             config[f"preset{preset_number}"] = current_position
-            # Save the updated configuration back to the file.
             await asyncio.to_thread(self.save_config, config)
             LOG.info("Preset %s set to position %s and saved to %s", preset_number, current_position, CONFIG_FILE)
         except Exception as e:
@@ -960,10 +985,8 @@ class AsyncMQTTClient:
     async def go_to_preset(self, preset_number):
         """
         Commands the desk to move to a preset position as defined in the configuration file.
-        This method loads the configuration, reads the preset value for the given preset number,
-        and then instructs the device to move to that position.
         Parameters:
-            preset_number (str): The preset number as a string (e.g., "1").
+            preset_number (str): The preset number (e.g., "1").
         """
         # Check if the desk is locked; if so, ignore preset movement commands.
         if self.locked:
@@ -1033,6 +1056,10 @@ async def async_main(args):
         for task in tasks:
             task.cancel()
 
+    # Register signal handlers for SIGTERM and SIGINT
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, lambda: asyncio.create_task(signal_handler()))
+
     try:
         if args.func == 'status':
             report = await device.get_position()
@@ -1047,7 +1074,6 @@ async def async_main(args):
             await mqtt_client.connect()
             # Schedule the device run loop as a background task.
             run_loop_task = asyncio.create_task(device.run_loop(mqtt_client.publish_state))
-            # Instead of waiting indefinitely on an Event, use a periodic sleep loop that checks for shutdown.
             try:
                 while not shutdown_triggered:
                     await asyncio.sleep(1)
@@ -1141,7 +1167,7 @@ def main():
         # Process daemon option only if running in MQTT mode
         if args.daemon:
             if sys.platform.startswith('linux'):
-                daemonize()  # Detach process on Linux only.
+                daemonize()
             else:
                 print("--daemon option is only supported on Linux; continuing in normal mode.")
 
