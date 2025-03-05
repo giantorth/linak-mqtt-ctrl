@@ -84,14 +84,23 @@ The `mqtt` command allows the script to run continuously in service mode, publis
 Basic usage:
 
 ```shell
-$ linak-mqtt-ctrl mqtt --server <MQTT_SERVER> --port <MQTT_PORT> --username <MQTT_USERNAME> --password <MQTT_PASSWORD>
+$ linak-mqtt-ctrl mqtt \
+   --server <MQTT_SERVER> \
+   --port <MQTT_PORT> \
+   --username <MQTT_USERNAME> \
+   --password <MQTT_PASSWORD> \
+   --daemon
 ```
+
+The --daemon flag will detach the program from the console and continue running.
 
 ## Configuration via File
 
-When running in MQTT mode, the script will look for a configuration file at `/etc/linakdesk/config.yaml`. This file can contain MQTT connection options. For example:
+When running in MQTT mode, the script will look for a configuration file at `/etc/linakdesk/config.yaml`. This file can contain MQTT connection options instead of passing via command line. 
 
 File must be writable by service for preset saving to work as they are stored in this file.
+
+Example:
 
 ```yaml
 server: "mqtt.example.com"
