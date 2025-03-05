@@ -34,7 +34,7 @@ Install system-wide:
 --------------------
 .. code:: shell-session
 
-   # sudo pip install linak-mqtt-ctrl
+   # sudo pip install .
 
 Or install dependencies from your system repositories and place the script in your ``$PATH``.
 
@@ -44,7 +44,8 @@ The project is built using setuptools. To build the package, simply run:
 
 .. code:: shell-session
 
-   $ python setup.py sdist bdist_wheel
+   $ pip build .
+   $ pip install .
 
 The build configuration is defined in [setup.py](setup.py) and [setup.cfg](setup.cfg).
 
@@ -107,8 +108,7 @@ service file and installation script.
 
 .. code:: shell-session
 
-   $ chmod +x install_service.sh
-   $ sudo ./install_service.sh
+   $ sudo bash install_service.sh
 
 This script copies the service file to ``/etc/systemd/system/``, creates a system user,
 reloads the systemd configuration, and starts the service. It also adds a udev rule to allow
