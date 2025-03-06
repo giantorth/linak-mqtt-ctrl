@@ -32,6 +32,7 @@ GET_STATUS = 0x0304
 BUF_LEN = 64
 MODE_OF_OPERATION = 0x03
 MODE_OF_OPERATION_DEFAULT = 0x04
+
 # USB Button commands
 MOVE_DOWN = 32767
 MOVE_UP = 32768
@@ -274,6 +275,7 @@ class AsyncLinakDevice:
                 self.context.handleEventsTimeout(0.1)
             except Exception as e:
                 LOG.error("USB event loop error: %s", e)
+                break
 
     async def async_ctrl_transfer(self, request_type, request, value, index, data, timeout=1000):
         """
@@ -424,9 +426,16 @@ class AsyncLinakDevice:
         """
         LOG.debug("Shutting down Linak device...")
         self._shutdown = True
+        # Give the event thread a short time to exit its loop.
         self.event_thread.join()
-        self.handle.close()
-        self.context.close()
+        try:
+            self.handle.close()
+        except Exception as e:
+            LOG.error("Error closing USB handle: %s", e)
+        try:
+            self.context.close()
+        except Exception as e:
+            LOG.error("Error closing USB context: %s", e)
 
     def _convert_position_to_percent(self, position):
         """
@@ -681,13 +690,17 @@ class AsyncMQTTClient:
         Runs until cancelled, the desk reaches its limits, or a stop command is requested.
         """
         config = self.load_config()
+        report = await self.async_device.get_position()
+        if report.position <= (config["desk_min_travel"]) and move_command == MOVE_DOWN:
+            LOG.info("Desk is already at the minimum travel limit (%s). Cancelling repeating move command.", report.position)
+            return
         try:
             # Check the device's stop flag to break the loop if a stop is requested.
             while not self.async_device._stop_requested:
                 await self.async_device._move(move_command)
                 report = await self.async_device.get_position()
                 # Check if the desk has reached its lower or upper limit.
-                if report.position <= (config["desk_min_travel"] + 200) or report.position >= DESK_MAX_HEIGHT:
+                if (report.position <= (config["desk_min_travel"]) and move_command == MOVE_DOWN ) or (report.position >= DESK_MAX_HEIGHT and move_command == MOVE_UP):
                     LOG.info("Desk reached limit (%s). Cancelling repeating move command.", report.position)
                     break
                 await asyncio.sleep(0.3)
@@ -727,6 +740,7 @@ class AsyncMQTTClient:
             "components": {
                 "standing_desk": {
                     "platform": "cover",
+                    "device_class": "damper",
                     "name": self.device_name,
                     "unique_id": self.entity_id,
                     "state_topic": self.state_topic,
