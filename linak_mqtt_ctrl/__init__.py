@@ -562,31 +562,36 @@ class AsyncMQTTClient:
     def on_connect(self, client, flags, rc, properties):
         """
         Callback when the MQTT client connects or reconnects.
-        We now ensure that the autodiscovery payload is sent first and then
-        all state information (desk state, lock state, desk height, and desk min travel)
-        is published immediately after.
+        We now subscribe to the Home Assistant status topic so that when its birth message is received,
+        all state information (desk state, lock state, etc.) is published.
         """
         LOG.info("Connected to MQTT broker with result code: %s, flags: %s, properties: %s", rc, flags, properties)
         # Schedule a task that publishes the autodiscovery payload and then all state information.
         asyncio.create_task(self.publish_discovery_and_state())
-        # Subscribe to topics for movement, lock, and preset commands.
+        # Subscribe to topics for movement, lock, presets, and Home Assistant status.
         client.subscribe(self.command_topic)
         client.subscribe("linak/desk/lock/set")
         client.subscribe("linak/desk/preset/+/go")
         client.subscribe("linak/desk/preset/+/set")
         client.subscribe("linak/desk/desk_min_travel/set")
-        # Publish availability message.
+        client.subscribe("homeassistant/status")
         asyncio.create_task(self.publish_availability("online"))
         self.force_publish = True
 
     async def on_message(self, client, topic, payload, qos, properties):
         """
         Callback when a message is received.
-        Processes movement commands received on the command topic,
-        lock commands, and the newly added preset commands.
+        Processes movement, lock, preset commands, and now also handles the
+        Home Assistant birth message to republish all state.
         """
         decoded_payload = payload.decode() if isinstance(payload, bytes) else payload
         LOG.info("Received message on topic %s: %s", topic, decoded_payload)
+
+        if topic == "homeassistant/status":
+            if decoded_payload.lower() == "online":
+                LOG.info("Home Assistant birth message received; publishing all state.")
+                await self.publish_all_state()
+            return
 
         # Handle messages on the cover (desk) command topic.
         if topic == self.command_topic:
@@ -870,7 +875,7 @@ class AsyncMQTTClient:
         # Publish desk state by querying the current device position.
         try:
             report = await self.async_device.get_position()
-            position_percent = self.percent_to_position(report.position)
+            position_percent = self.position_to_percent(report.position)
             state_payload = {
                 "position": position_percent,
                 "raw_position": report.position,
