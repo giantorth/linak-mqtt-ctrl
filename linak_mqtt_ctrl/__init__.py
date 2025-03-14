@@ -533,6 +533,9 @@ class AsyncMQTTClient:
         self.client.on_message = self.on_message
         self.client.on_subscribe = self.on_subscribe
         self.client.on_log = self.on_log
+        
+        # Load configuration at startup and store it in memory.
+        self.config = self.load_config()
 
         # Initialize discovery publish timestamp (for logging purposes only).
         self._last_discovery_publish = None
@@ -626,8 +629,6 @@ class AsyncMQTTClient:
                 if self._button_repeat_task:
                     self._button_repeat_task.cancel()
                     self._button_repeat_task = None
-                # NEW: Instead of just sending a MOVE_STOP command once,
-                # call the stop_movement() method to ensure all movement is halted.
                 asyncio.create_task(self.async_device.stop_movement())
             elif isinstance(command_value, int):
                 position = self.percent_to_position(command_value)
@@ -655,7 +656,7 @@ class AsyncMQTTClient:
             self.client.publish("linak/desk/lock/state", lock_state, qos=1)
             LOG.info("Published lock state: %s", lock_state)
 
-        # NEW: Handle preset commands (both "set" and "go").
+        #Handle preset commands (both "set" and "go").
         elif topic.startswith("linak/desk/preset/"):
             parts = topic.split('/')
             if len(parts) < 5:
@@ -672,15 +673,13 @@ class AsyncMQTTClient:
                 await self.go_to_preset(preset_number)
             else:
                 LOG.error("Unknown preset command: %s", command)
-        # NEW: Handle messages to set the desk_min_travel value.
         elif topic == "linak/desk/desk_min_travel/set":
             try:
                 new_min = int(decoded_payload)
                 self.async_device.min_travel = new_min
                 LOG.info("Updated desk_min_travel to: %s", new_min)
-                config = self.load_config()
-                config["desk_min_travel"] = new_min
-                self.save_config(config)
+                self.config["desk_min_travel"] = new_min
+                self.save_config(self.config)
                 self.client.publish("linak/desk/desk_min_travel/state", str(new_min), qos=1)
             except ValueError:
                 LOG.error("Invalid desk_min_travel value received: %s", decoded_payload)
@@ -994,9 +993,9 @@ class AsyncMQTTClient:
             report = await self.async_device.get_position()
             current_position = report.position
             LOG.info("Current position retrieved for preset %s: %s", preset_number, current_position)
-            config = await asyncio.to_thread(self.load_config)
-            config[f"preset{preset_number}"] = current_position
-            await asyncio.to_thread(self.save_config, config)
+            # Update the in-memory config and save it to disk.
+            self.config[f"preset{preset_number}"] = current_position
+            await asyncio.to_thread(self.save_config, self.config)
             LOG.info("Preset %s set to position %s and saved to %s", preset_number, current_position, CONFIG_FILE)
         except Exception as e:
             LOG.error("Error setting preset %s: %s", preset_number, e)
@@ -1012,13 +1011,11 @@ class AsyncMQTTClient:
             LOG.warning("Preset movement command ignored because desk is locked.")
             return
         try:
-            # Load the configuration from the file.
-            config = await asyncio.to_thread(self.load_config)
             preset_key = f"preset{preset_number}"
-            if preset_key not in config:
+            if preset_key not in self.config:
                 LOG.error("Preset %s not found in configuration file %s.", preset_number, CONFIG_FILE)
                 return
-            target_position = config[preset_key]
+            target_position = self.config[preset_key]
             LOG.info("Moving desk to preset %s position: %s", preset_number, target_position)
             # Command the device to move to the target position.
             asyncio.create_task(self.async_device.move(target_position))
