@@ -1,6 +1,6 @@
 # linak-mqtt-ctrl
 
-A simple Python script to control Linak powered desks and the USB2LIN06 cable over MQTT, with Home Assistant autodiscovery.
+A Python script to control Linak powered desks and the USB2LIN06 cable over MQTT, with Home Assistant autodiscovery.
 
 ![Home Assistant Controls](image.png)
 
